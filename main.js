@@ -2379,6 +2379,83 @@ async function deviceCodePoll({ clientId, tenant, deviceCode, interval, expiresI
   throw expired();
 }
 
+/* ---- more than one Microsoft account: the model (#38, part 1) -----------
+ * `outlookAccounts` in data.json, optional, one record per Microsoft
+ * account, typed by hand for now:
+ *
+ *   [ { "accountId": "default", "label": "Personal", "enabled": true },
+ *     { "accountId": "work",    "label": "Work",     "enabled": true } ]
+ *
+ * ABSENT means one account, and that account is the sign-in that already
+ * exists: `default` is RESERVED for it and IS the flat outlook* fields (the
+ * client id, the tenant, the scopes, the four secret keys), exactly where
+ * they are. So a data.json without the key, or with a list that names only
+ * `default`, behaves as every release before this one, and nobody signs in
+ * again. No default is laid under the key on purpose: a `[]` in
+ * DEFAULT_SETTINGS would be written into every member's data.json on the
+ * next save, and the point of this step is that a one-account vault is not
+ * touched. Nothing reads the list yet beyond the helpers below; the sign-in
+ * per account and the sync per account are the parts that follow.
+ */
+const OUTLOOK_DEFAULT_ACCOUNT = 'default';
+// Lowercase letters, digits and dashes, starting with a letter or a digit,
+// 32 at most: the alphabet the secret store accepts for a key, so an id
+// needs no escaping on its way into one.
+const OUTLOOK_ACCOUNT_ID_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
+// Validated, never transformed. The id goes into key names and note stamps
+// as it is; a silent trim or lowercase would let two spellings of a record
+// be one account, and hand the second one the first one's tokens.
+function outlookAccountId(raw) {
+  return typeof raw === 'string' && OUTLOOK_ACCOUNT_ID_RE.test(raw) ? raw : '';
+}
+// One record, read: the id, the label the member picked (the id when there
+// is none), and whether the account syncs. `enabled: false` stops that
+// account's sync and deletes nothing. Any other key on the record (room for
+// a per-account folder list later) stays where it is and is read by nobody.
+function normalizeOutlookAccount(rec, accountId) {
+  const r = rec && typeof rec === 'object' ? rec : {};
+  return { accountId, label: trimmed(r.label) || accountId, enabled: r.enabled !== false };
+}
+// Every account, `default` always first and always present. A record that
+// is not an object, has no usable id, or repeats an id falls out here, so no
+// later step has to think about it. Pure: the list in the settings is read,
+// never rewritten.
+function outlookAccountList(settings) {
+  const s = settings || {};
+  const raw = Array.isArray(s.outlookAccounts) ? s.outlookAccounts : [];
+  const out = [];
+  const seen = new Set();
+  for (const rec of raw) {
+    if (!rec || typeof rec !== 'object') continue;
+    const id = outlookAccountId(rec.accountId);
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push(normalizeOutlookAccount(rec, id));
+  }
+  const at = out.findIndex((a) => a.accountId === OUTLOOK_DEFAULT_ACCOUNT);
+  if (at < 0) out.unshift(normalizeOutlookAccount(null, OUTLOOK_DEFAULT_ACCOUNT));
+  else if (at > 0) out.unshift(out.splice(at, 1)[0]);
+  return out;
+}
+// Never the WRONG account. Only an ABSENT id means the default. An id the
+// list does not carry (a note left behind by a record that was removed, or
+// a hand-edited `source_account: Work`) resolves to a blank, DISABLED
+// account of that id, so whoever asks reads "do not sync" instead of
+// quietly falling back to the first mailbox and reading, or writing a flag
+// to, somebody else's mail.
+function outlookAccountById(settings, accountId) {
+  const id = accountId == null || accountId === '' ? OUTLOOK_DEFAULT_ACCOUNT : String(accountId);
+  return outlookAccountList(settings).find((a) => a.accountId === id) || { accountId: id, label: id, enabled: false };
+}
+// The account a note belongs to. ABSENT MEANS `default`: the stamp is
+// written only for the second mailbox onward, so every note from before
+// accounts existed is right without ever being opened. Answers the stamp as
+// written; outlookAccountById says whether it names a listed account.
+function itemAccountId(item) {
+  const v = item && item.sourceAccount != null ? String(item.sourceAccount) : '';
+  return v || OUTLOOK_DEFAULT_ACCOUNT;
+}
+
 /* ---- the stored sign-in ---- */
 function outlookSignedIn(settings) {
   const s = settings || {};
@@ -4499,6 +4576,12 @@ function itemFromFrontmatter(fm, path, basename) {
     url: fm.url ? String(fm.url) : null,
     tags: Array.isArray(fm.tags) ? fm.tags.map(String) : [],
     sourceStatus: fm.source_status != null ? String(fm.source_status) : null,
+    // Which sign-in of a multi-account source this note came from. ABSENT
+    // MEANS `default` (itemAccountId), which is what makes every note
+    // written before accounts existed correct with no write at all. Read as
+    // written, never validated here: the lookup (outlookAccountById) is
+    // where an unknown value becomes a disabled account.
+    sourceAccount: fm.source_account != null && fm.source_account !== '' ? String(fm.source_account) : null,
     listId: fm.list_id != null ? String(fm.list_id) : null,
     plannedDay: fm.planned_day ? String(fm.planned_day).slice(0, 10) : null,
     plannedHalf: fm.planned_half === 'am' || fm.planned_half === 'pm' ? fm.planned_half : null,
@@ -12211,4 +12294,7 @@ module.exports.__test = {
   outlookMessagesQuery, outlookPriorityRank, outlookItemFromMessage, outlookFetchOpen, outlookSetClosed, outlookStatusText,
   graphCalendarWindow, graphCalendarQuery, graphInstant, graphAllDay, graphEventDef, outlookCalendarFetchFeed,
   calendarFeedConnector, calendarFeedReady, ensureGraphCalendarFeed, GRAPH_FEED_ID, noteIdPart,
+  // more than one Microsoft account: the model (#38, part 1)
+  OUTLOOK_DEFAULT_ACCOUNT, OUTLOOK_ACCOUNT_ID_RE, outlookAccountId, normalizeOutlookAccount, outlookAccountList,
+  outlookAccountById, itemAccountId,
 };
