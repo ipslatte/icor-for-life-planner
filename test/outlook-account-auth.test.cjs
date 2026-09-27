@@ -286,7 +286,7 @@ test('a further account\'s sign-in stores under its keys and leaves the default\
   assert.equal(p.saved.length, 1);
   assert.ok(!/rt-|at-/.test(p.saved[0]), 'no token in what reaches disk');
   assert.equal(p.synced, 1, 'a further account syncs on its own run once signed in (part 3)');
-  assert.deepEqual(s.calendars, [GRAPH_FEED], 'and no calendar feed for it yet');
+  assert.deepEqual(s.calendars.map((f) => f.id), ['outlook-graph', 'outlook-graph-work'], 'and its own calendar feed, never under the default\'s id (part 3)');
   assert.equal(T.outlookSignedIn(T.outlookAccountView(T.withSecrets(s, vault), 'work')), true);
   // Sign out of work: its four keys and its scopes go, the default stays.
   await p.outlookSignOut('work');
@@ -295,11 +295,11 @@ test('a further account\'s sign-in stores under its keys and leaves the default\
   assert.ok(!Object.keys(s).some((k) => k.endsWith('__work')), 'the suffixed fields leave data.json');
   assert.equal(s.outlookScopes, 'Mail.Read Calendars.Read');
   assert.equal(T.outlookSignedIn(T.withSecrets(s, vault)), true, 'the default is still signed in');
-  assert.equal(p.recomputed, 0, 'no calendar feed to recompute for a further account');
+  assert.equal(p.recomputed, 1, 'its calendar events leave the board on sign-out, as the default\'s do (part 3)');
   // Sign out of the default: the literal legacy path; the other account's key stays.
   storage.setSecret(WORK_KEYS[0], 'rt-w9');
   await p.outlookSignOut();
-  assert.deepEqual([storage.getSecret(DEFAULT_KEYS[0]), storage.getSecret(DEFAULT_KEYS[3]), s.outlookScopes, p.recomputed], ['', '', '', 1]);
+  assert.deepEqual([storage.getSecret(DEFAULT_KEYS[0]), storage.getSecret(DEFAULT_KEYS[3]), s.outlookScopes, p.recomputed], ['', '', '', 2]);
   assert.equal(storage.getSecret(WORK_KEYS[0]), 'rt-w9', 'the other account\'s key stays');
   await p.outlookSignOut('Work');
   assert.equal(storage.getSecret(WORK_KEYS[0]), 'rt-w9', 'an id the rule refuses signs nobody out');
@@ -327,7 +327,8 @@ test('source scan: the walkers on secretFieldNames(), the pins the sign-in keeps
   assert.equal((c.match(/const s = this\.withSecrets\(\);/g) || []).length, 4);
   assert.match(c, /clearOutlookTokens\(\{ live: this\.settings, vault: this\.secrets \}\)/, 'the default sign-out is the literal call');
   assert.match(c, /clearOutlookTokens\(\{ live: this\.settings, vault: this\.secrets, account: id \}\)/, 'a further account takes the widened one');
-  assert.equal((c.match(/ensureGraphCalendarFeed\(/g) || []).length, 2, 'the definition and the one default call; no feed for a further account in this part');
+  assert.equal((c.match(/ensureGraphCalendarFeed\(/g) || []).length, 3, 'the definition, the literal default call, and the widened call for a further account (part 3)');
+  assert.match(c, /ensureGraphCalendarFeed\(this\.settings\);/, 'the default\'s call is the literal one');
   assert.doesNotMatch(c, /this\._outlookPending = (\{|null)/, 'no single latest sign-in any more');
   assert.doesNotMatch(c, /this\.(plugin\.)?settings\.outlook(RefreshToken|AccessToken|ExpiresAt|Account)(__|\b)/, 'no class reads a token off the settings, suffixed or not');
   assert.match(c, /const pending = modal \? modal\.pending : null;/, 'the device code finishes the account the modal was opened for');

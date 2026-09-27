@@ -450,7 +450,7 @@ test('a listed account never signed in answers degraded, never a healthy empty s
   assert.equal(d.reason, 'disabled');
   assert.equal(T.outlookSignedIn(pw), true, 'still signed in');
   assert.deepEqual(paused.calendars, [GRAPH_FEED], 'the outlook-graph feed stays');
-  assert.deepEqual(T.enabledCalendarFeeds(pw).map((f) => f.id), ['outlook-graph'], 'and is still read in this part; the calendar per account is the next one');
+  assert.deepEqual(T.enabledCalendarFeeds(pw).map((f) => f.id), [], 'and is not fetched while its account is switched off, like its mail');
   assert.equal((await T.outlookFetchOpen({})).reason, 'no-token');
   assert.equal((await T.outlookFetchOpen({ outlookClientId: CLIENT })).reason, 'no-token');
   assert.equal((await T.outlookFetchOpen({ outlookAccounts: THREE })).reason, 'no-token', 'the flat settings are the default, enabled');
@@ -704,7 +704,7 @@ test('source scan: the pins the sync core keeps, and every shadow key in the cla
   assert.doesNotMatch(cls, /`\$\{(source|item\.source)\}:\$\{/, 'no bare source:id key is built in the class any more');
   assert.doesNotMatch(c, /source === 'outlook'/, 'the source with accounts is asked from the registry, not by name');
   assert.doesNotMatch(c, /'outlook'\s*\]/);
-  assert.equal((c.match(/ensureGraphCalendarFeed\(/g) || []).length, 2, 'no calendar feed for a further account in this part');
+  assert.equal((c.match(/ensureGraphCalendarFeed\(/g) || []).length, 3, 'the definition, the default\'s literal call, the widened call for a further account');
   assert.doesNotMatch(c, /later update/, 'the sign-in row and notice no longer defer the sync');
   assert.match(c, /new Notice\(`Planner: signed in to Outlook \(\$\{label\}\)\$\{account \? ` as \$\{account\}` : ''\}\.`\);\n\s*if \(pending\.onDone\) pending\.onDone\(\);\n\s*this\.syncNow\(false\);/, 'a further account syncs on sign-in, like the default');
   assert.match(c, /function outlookFetchOpen\(settings, deps\) \{\n\s*const s = settings \|\| \{\};\n\s*if \(!outlookAccountById\(s, s\._account\)\.enabled\) return degraded\('outlook', 'disabled'/);

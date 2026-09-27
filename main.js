@@ -173,9 +173,12 @@ const CONNECTORS = {
     id: 'outlook-calendar', label: 'Outlook calendar', folder: null, kind: 'calendar',
     feedKind: 'graph',
     feeds: (s) => calendarFeeds(s).filter((f) => f.kind === 'graph'),
-    ready: (feed, s) => outlookSignedIn(s || {}),
+    // Ready and fetched through the feed's own account (#38, part 3): a
+    // feed without an accountId is the default's, and reads as it always
+    // did.
+    ready: (feed, s) => outlookFeedReady(feed, s || {}),
     configured: (s) => enabledCalendarFeeds(s).some((f) => f.kind === 'graph'),
-    fetchFeed: (feed, s, deps) => outlookCalendarFetchFeed(feed, s, deps),
+    fetchFeed: (feed, s, deps) => outlookCalendarFetchFeed(feed, outlookFeedView(s, feed), deps),
     fetchOpen: null, setClosed: null, pushFields: null,
     platforms: ['desktop', 'mobile'],
     svg: 'M4 2h2v20H4V2zm3 1h12.5l-3.4 4.75L19.5 12.5H7V3z',
@@ -4117,7 +4120,7 @@ function calendarNameForUrl(url) {
 function normalizeCalendarFeed(raw, index) {
   const f = raw && typeof raw === 'object' ? raw : {};
   const i = Number(index) || 0;
-  return {
+  const out = {
     id: typeof f.id === 'string' && f.id.trim() ? f.id.trim() : `cal-${i + 1}`,
     name: typeof f.name === 'string' && f.name.trim() ? f.name.trim() : `Calendar ${i + 1}`,
     url: typeof f.url === 'string' ? f.url.trim() : '',
@@ -4125,6 +4128,13 @@ function normalizeCalendarFeed(raw, index) {
     enabled: f.enabled !== false,
     kind: typeof f.kind === 'string' && f.kind ? f.kind : 'ics',
   };
+  // A Graph feed may name its Microsoft account (#38, part 3). Carried as
+  // written and only when present, so a feed from before accounts existed
+  // keeps its six keys and is the default's. An id nothing lists resolves
+  // to a disabled account when read (outlookAccountById), never to the
+  // default's mailbox.
+  if (out.kind === 'graph' && typeof f.accountId === 'string' && f.accountId) out.accountId = f.accountId;
+  return out;
 }
 
 // The feeds in settings order, sanitised. Settings without a `calendars`
@@ -4157,11 +4167,48 @@ function calendarFeedConfigured(settings) { return enabledCalendarFeeds(settings
 // The Outlook calendar entry, added once on sign-in (removable; a later
 // sign-in adds it again). Takes the least-used lens like a pasted feed.
 const GRAPH_FEED_ID = 'outlook-graph';
-function ensureGraphCalendarFeed(settings) {
+// One feed per account (#38, part 3). The default keeps the bare id, the
+// same reservation the secret keys and the shadow keys make, so the feed
+// already in data.json, and the lens colour on it, survive untouched. A
+// further account's feed never reuses `outlook-graph`, or the per-feed
+// defs would merge under one id.
+function graphFeedId(accountId) {
+  const a = accountId == null || accountId === '' ? OUTLOOK_DEFAULT_ACCOUNT : String(accountId);
+  return a === OUTLOOK_DEFAULT_ACCOUNT ? GRAPH_FEED_ID : `${GRAPH_FEED_ID}-${a}`;
+}
+// The account a Graph feed reads. A feed written before accounts existed
+// carries no accountId, and it is the default's.
+function graphFeedAccountId(feed) {
+  const v = feed && typeof feed.accountId === 'string' ? feed.accountId : '';
+  return v || OUTLOOK_DEFAULT_ACCOUNT;
+}
+// The settings as one Graph feed's account sees them (the flat shape
+// outlookCalendarFetchFeed reads); the default answers the settings
+// themselves. One view per account per resolved copy, so two feeds of one
+// account share a view and a rotated token.
+function outlookFeedView(settings, feed) {
   const s = settings || {};
+  return outlookAccountView(s, outlookAccountById(s, graphFeedAccountId(feed)));
+}
+// Can this Graph feed be fetched: its account is listed and switched on,
+// and that account is signed in. An account switched off is not fetched,
+// like its mail; its feed stays in the list and says so.
+function outlookFeedReady(feed, settings) {
+  const s = settings || {};
+  return outlookAccountById(s, graphFeedAccountId(feed)).enabled && outlookSignedIn(outlookFeedView(s, feed));
+}
+function ensureGraphCalendarFeed(settings, accountId, label) {
+  const s = settings || {};
+  const acct = accountId == null || accountId === '' ? OUTLOOK_DEFAULT_ACCOUNT : String(accountId);
   if (!Array.isArray(s.calendars)) s.calendars = calendarFeeds(s);
-  if (s.calendars.some((f) => f && f.kind === 'graph')) return false;
-  s.calendars.push({ id: GRAPH_FEED_ID, name: 'Outlook calendar', url: '', color: leastUsedSwatch(s.calendars), enabled: true, kind: 'graph' });
+  // Scoped to this account: "any graph feed at all" would leave a second
+  // mailbox with no calendar.
+  if (s.calendars.some((f) => f && f.kind === 'graph' && graphFeedAccountId(f) === acct)) return false;
+  const feed = { id: graphFeedId(acct), name: 'Outlook calendar', url: '', color: leastUsedSwatch(s.calendars), enabled: true, kind: 'graph' };
+  // The default's feed keeps the shape it has always had, six keys and no
+  // accountId; a further account's names itself and its account.
+  if (acct !== OUTLOOK_DEFAULT_ACCOUNT) { feed.name = `Outlook calendar (${trimmed(label) || acct})`; feed.accountId = acct; }
+  s.calendars.push(feed);
   return true;
 }
 
@@ -4329,7 +4376,10 @@ function calendarAggregateStatus(feeds, results, merged, now) {
 // `settings` (optional, resolved) is what the Graph feed's readiness reads.
 function calendarFeedStatusText(feed, st, vault, settings) {
   if (feed && feed.kind === 'graph') {
-    if (!outlookSignedIn(settings || {})) return 'Sign in to your Microsoft account under Outlook to connect this calendar.';
+    // The feed's own account (#38, part 3); the default reads as it did.
+    const account = outlookAccountById(settings || {}, graphFeedAccountId(feed));
+    if (!account.enabled) return `Off: its Microsoft account (${account.label}) is switched off in the account list, or not listed.`;
+    if (!outlookSignedIn(outlookFeedView(settings || {}, feed))) return 'Sign in to your Microsoft account under Outlook to connect this calendar.';
   } else if (!feed || !feedUrl(feed, vault)) return 'Paste the iCal address to connect this calendar.';
   if (feed.enabled === false) return 'Off: its events are hidden until it is switched on.';
   if (!st) return 'Not synced yet this session.';
@@ -8275,8 +8325,8 @@ class IcorPlannerPlugin extends Plugin {
 
   // The same for a further account (#38, part 2): its own suffixed fields
   // and store keys through a sink that names it, its own /me through its
-  // view, its own granted scopes, and a sync (part 3), which runs that
-  // account's mail on its own view. No calendar feed for it yet.
+  // view, its own granted scopes, its own Graph calendar feed, and a sync
+  // (part 3), which runs that account's mail and calendar on its own view.
   async outlookFinishAccountSignIn(tokens, pending, deps) {
     const id = pending.accountId;
     const label = outlookAccountById(this.settings, id).label;
@@ -8288,6 +8338,7 @@ class IcorPlannerPlugin extends Plugin {
       account = trimmed(me.mail) || trimmed(me.userPrincipalName) || trimmed(me.displayName);
     } catch { /* the account line is a nicety; the tokens are what matter */ }
     writeSecret(this.settings, this.secrets, outlookAccountField(id, 'outlookAccount'), account || 'Microsoft account');
+    ensureGraphCalendarFeed(this.settings, id, label);
     delete this.syncStatus.outlook;
     await this.saveSettings();
     this.outlookCloseModalFor(pending);
@@ -8328,6 +8379,9 @@ class IcorPlannerPlugin extends Plugin {
     for (const f of OUTLOOK_ACCOUNT_FIELDS) delete this.settings[outlookAccountField(id, f)];
     this.outlookClearPending(id);
     await this.saveSettings();
+    // Its calendar feed stays and says it wants a sign-in, as the default's
+    // does; its events leave the board now rather than at the next sync.
+    this.recomputeCalendarDefs();
     new Notice(`Planner: signed out of Outlook (${label}). The token is gone from this vault; to revoke the app on Microsoft's side too, use the link in settings.`, 8000);
   }
 
@@ -12779,4 +12833,6 @@ module.exports.__test = {
   // more than one Microsoft account: the sync (#38, part 3)
   sourceHasAccounts, itemShadowAccount, shadowKey, shadowPrefix, outlookExtraRuns, mergeSyncStatus, outlookItemAccount,
   outlookAccountsNeedingWrite, outlookWriteConsentNotice, outlookProbeGone, shadowedByOtherAccount, anchoredShadowIds, sourceConnected,
+  // more than one Microsoft account: the calendar feed per account (#38, part 3)
+  graphFeedId, graphFeedAccountId, outlookFeedView, outlookFeedReady,
 };
