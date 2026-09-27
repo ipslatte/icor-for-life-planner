@@ -2398,10 +2398,12 @@ async function deviceCodePoll({ clientId, tenant, deviceCode, interval, expiresI
  * per account and the sync per account are the parts that follow.
  */
 const OUTLOOK_DEFAULT_ACCOUNT = 'default';
-// Lowercase letters, digits and dashes, starting with a letter or a digit,
-// 32 at most: the alphabet the secret store accepts for a key, so an id
-// needs no escaping on its way into one.
-const OUTLOOK_ACCOUNT_ID_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
+// Lowercase letters, digits and single dashes between them, no leading,
+// trailing or doubled dash, 32 at most: the alphabet the secret store
+// accepts for a key, in the one shape secretKey() and envKeyFor() pass
+// through unchanged. Those two fold dash runs and strip a trailing dash, so
+// `work-` and `work` would otherwise be two accounts sharing one token set.
+const OUTLOOK_ACCOUNT_ID_RE = /^(?=.{1,32}$)[a-z0-9]+(?:-[a-z0-9]+)*$/;
 // Validated, never transformed. The id goes into key names and note stamps
 // as it is; a silent trim or lowercase would let two spellings of a record
 // be one account, and hand the second one the first one's tokens.
@@ -4580,8 +4582,9 @@ function itemFromFrontmatter(fm, path, basename) {
     // MEANS `default` (itemAccountId), which is what makes every note
     // written before accounts existed correct with no write at all. Read as
     // written, never validated here: the lookup (outlookAccountById) is
-    // where an unknown value becomes a disabled account.
-    sourceAccount: fm.source_account != null && fm.source_account !== '' ? String(fm.source_account) : null,
+    // where an unknown value becomes a disabled account. Strings only: a
+    // list or a number the Properties editor typed is no stamp.
+    sourceAccount: typeof fm.source_account === 'string' && fm.source_account !== '' ? fm.source_account : null,
     listId: fm.list_id != null ? String(fm.list_id) : null,
     plannedDay: fm.planned_day ? String(fm.planned_day).slice(0, 10) : null,
     plannedHalf: fm.planned_half === 'am' || fm.planned_half === 'pm' ? fm.planned_half : null,

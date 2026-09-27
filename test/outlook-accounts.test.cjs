@@ -130,13 +130,23 @@ test('THE ASK (#38, point 4): the secret key list is the same with no key, with 
 
 test('an account id is lowercase letters, digits and dashes: validated, never transformed', () => {
   assert.equal(T.OUTLOOK_DEFAULT_ACCOUNT, 'default');
-  for (const ok of ['default', 'work', 'work-2', 'a', '0', 'a-b-c', 'x'.repeat(32)]) assert.equal(T.outlookAccountId(ok), ok, ok);
-  for (const bad of ['', ' ', 'Work', 'WORK', ' work', 'work ', 'wo rk', 'work_2', 'work.2', '-work', 'a@b', 'ünïcode', 'x'.repeat(33), null, undefined, 7, {}, ['work']]) {
+  const accepted = ['default', 'work', 'work-2', 'a', '0', 'a-b-c', 'x'.repeat(32), 'a-' + 'x'.repeat(30)];
+  for (const ok of accepted) assert.equal(T.outlookAccountId(ok), ok, ok);
+  for (const bad of ['', ' ', 'Work', 'WORK', ' work', 'work ', 'wo rk', 'work_2', 'work.2', '-work', 'work-', 'a-', 'a--b', 'a@b', 'ünïcode', 'x'.repeat(33), 'a-' + 'x'.repeat(31), null, undefined, 7, {}, ['work']]) {
     assert.equal(T.outlookAccountId(bad), '', `rejected as given, never fixed up: ${JSON.stringify(bad)}`);
   }
-  // The secret store's own alphabet, as the auth tests fake it: every valid
-  // id is a valid key fragment without escaping.
-  assert.match('work-2', /^[a-z0-9-]+$/);
+  // The property that matters: an accepted id reaches a store key unchanged
+  // (secretKey folds dash runs and strips a trailing dash, so a shape it
+  // would fold is not an id), and no two accepted ids share an env key.
+  const envKeys = new Set();
+  for (const id of accepted) {
+    const key = T.secretKey(`outlook-refresh-token-${id}`);
+    assert.equal(key, `${T.SECRET_KEY_PREFIX}outlook-refresh-token-${id}`, `unchanged on the way into a key: ${id}`);
+    assert.match(key, /^[a-z0-9-]+$/, 'the store alphabet, as the auth tests fake it');
+    envKeys.add(T.envKeyFor(key));
+  }
+  assert.equal(envKeys.size, accepted.length, 'pairwise distinct env keys');
+  assert.notEqual(T.secretKey('outlook-refresh-token-work-'), `${T.SECRET_KEY_PREFIX}outlook-refresh-token-work-`, 'the shape the rule refuses is the shape secretKey would fold');
   assert.equal(T.OUTLOOK_ACCOUNT_ID_RE.test('Work'), false, 'the rule is a regex the sign-in step reuses as is');
 });
 
@@ -200,6 +210,10 @@ test('the stamp: source_account is read as written, and absent means default', (
   assert.equal(T.itemAccountId(plain), 'default');
   assert.equal(T.itemFromFrontmatter(fm({ source_account: '' }), 'p', 'b').sourceAccount, null, 'an empty stamp is no stamp');
   assert.equal(T.itemFromFrontmatter(fm({ source_account: null }), 'p', 'b').sourceAccount, null);
+  // Strings only: a list or a number the Properties editor typed is no stamp,
+  // so `[work]` never matches the work account.
+  assert.equal(T.itemFromFrontmatter(fm({ source_account: ['work'] }), 'p', 'b').sourceAccount, null);
+  assert.equal(T.itemFromFrontmatter(fm({ source_account: 7 }), 'p', 'b').sourceAccount, null);
   const work = T.itemFromFrontmatter(fm({ source_account: 'work' }), 'p', 'b');
   assert.equal(work.sourceAccount, 'work');
   assert.equal(T.itemAccountId(work), 'work');
@@ -217,14 +231,14 @@ test('the stamp: source_account is read as written, and absent means default', (
   assert.equal(T.itemAccountId({}), 'default');
   assert.equal(T.itemAccountId(null), 'default');
   assert.equal(T.itemAccountId({ sourceAccount: '' }), 'default');
-  assert.equal(T.itemAccountId({ sourceAccount: 7 }), '7');
+  assert.equal(T.itemAccountId({ sourceAccount: 'work' }), 'work');
 });
 
 test('source scan: this step writes no stamp and lays no default under outlookAccounts', () => {
   const c = code();
   const stampLines = c.split('\n').filter((l) => l.includes('source_account') && !/^\s*(\/\/|\*|\/\*)/.test(l));
   assert.equal(stampLines.length, 1, 'the reader in itemFromFrontmatter is the one line of code that names the field');
-  assert.match(stampLines[0], /^\s*sourceAccount: fm\.source_account/);
+  assert.match(stampLines[0], /^\s*sourceAccount: typeof fm\.source_account === 'string'/);
   const defaults = c.slice(c.indexOf('const DEFAULT_SETTINGS = {'), c.indexOf('\n};', c.indexOf('const DEFAULT_SETTINGS = {')));
   assert.doesNotMatch(defaults, /outlookAccounts/, 'no default under the key, so no save adds it');
   // The list is read through one function and nowhere else, so the shape
