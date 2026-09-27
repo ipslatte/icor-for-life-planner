@@ -122,6 +122,7 @@ function plugin(settings, files) {
   p._syncWrites = new Map();
   p._goneProbed = new Set();
   p.syncStatus = {};
+  p.syncStatusByAccount = {};
   return { p, trashed, created, byPath };
 }
 // What syncNow reaches for beyond the sync itself, stubbed.

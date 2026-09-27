@@ -2654,6 +2654,9 @@ function shadowedByOtherAccount(settings, shadowMap, source, item) {
 // own view. The default is the run syncNow already makes from the registry
 // and is not here. An account switched off contributes no run and is
 // therefore never fetched and never reconciled.
+// What a switched-off account's run says; the tray says the same under that
+// account's own head (traySourceSections), so the two never drift apart.
+const OUTLOOK_DISABLED_MESSAGE = 'Switched off in the account list.';
 function outlookExtraRuns(settings) {
   const s = settings || {};
   const runs = [];
@@ -2880,7 +2883,7 @@ async function outlookFetchOpen(settings, deps) {
   // An account switched off in the list is not fetched: a degraded result,
   // so the upsert never runs and none of its notes is reconciled. The view
   // names its account; the flat settings are the default.
-  if (!outlookAccountById(s, s._account).enabled) return degraded('outlook', 'disabled', 'Switched off in the account list.');
+  if (!outlookAccountById(s, s._account).enabled) return degraded('outlook', 'disabled', OUTLOOK_DISABLED_MESSAGE);
   if (!trimmed(s.outlookClientId)) return degraded('outlook', 'no-token', 'Outlook is not connected (no client id).');
   if (!outlookSignedIn(s)) return degraded('outlook', 'no-token', 'Outlook is not signed in.');
   try {
@@ -7164,6 +7167,7 @@ class IcorPlannerPlugin extends Plugin {
     this.calendarStale = false;      // true while defs come from the vault cache, not a live fetch
     this.calendarStatus = null;      // last calendar ConnectorResult status
     this.syncStatus = {};            // source -> { ok, reason, message, count, at }
+    this.syncStatusByAccount = {};   // Outlook account id -> that account's own row; written only when more than one account is listed (#38, part 4)
     this.syncing = false;
     this.lastSyncAt = null;
     // One auto-reveal of the tray per session (trayRevealDecision).
@@ -7785,6 +7789,10 @@ class IcorPlannerPlugin extends Plugin {
         };
         this.syncStatus[source] = started.has(source) ? mergeSyncStatus(this.syncStatus[source], next) : next;
         started.add(source);
+        // The row above is one per source; the tray's per-account sections
+        // read each account's own run, so a second mailbox's failure is
+        // shown under its own head and nobody else's. Empty with one account.
+        if (label) this.syncStatusByAccount[(account || accounts[0]).accountId] = next;
         if (sourceHasAccounts(source)) result.account = account ? account.accountId : OUTLOOK_DEFAULT_ACCOUNT;
         if (result.ok) await this.upsertSource(source, result);
       }
@@ -10930,6 +10938,61 @@ function trayConnectionState(settings) {
   };
 }
 
+/* ---- one tray section per Microsoft account (#38, part 4) ----------------
+ *
+ * A source with one account renders the section it always has: keyed and
+ * labelled by the source, admitting every item of the source, reading the
+ * source's status row, so a vault with no `outlookAccounts` (or the default
+ * alone) renders what it did, byte for byte. With two or more accounts
+ * listed, Outlook renders one section per account in list order (default
+ * first), headed by the account's label (its id when it has none), each
+ * counting only its own notes, each collapsing on its own, each reading its
+ * OWN run's status (syncStatusByAccount) rather than the folded row, so a
+ * second mailbox that is not signed in or unreachable says so under its own
+ * head while the first shows its notes. The default keeps the bare `outlook`
+ * collapse key, so a collapse made before this build still holds; every
+ * other account is keyed `outlook@<id>`, the shape the shadow keys use.
+ *
+ * A note's account is what itemAccountId reads, the same resolver the sync
+ * uses: only an ABSENT stamp is the default's. A stamp nothing lists (a
+ * record removed, a hand-edited `source_account: Work`) is an account
+ * nothing lists, and its notes get a trailing section of their own, named
+ * "(not listed)", never the first mailbox's list: filing them there would
+ * be the tray making the guess the sync refuses to make. An account switched
+ * off keeps its section and its notes, with the same sentence its run would
+ * give, since it contributes no run and would otherwise read as waiting.
+ */
+function traySectionKey(source, accountId) {
+  return accountId === OUTLOOK_DEFAULT_ACCOUNT ? source : `${source}@${accountId}`;
+}
+function traySourceSections(settings, source, items, statusByAccount) {
+  const meta = SOURCES[source];
+  const whole = { key: source, label: meta.label, account: null, configured: sourceConfigured(settings, source), member: () => true };
+  if (!sourceHasAccounts(source)) return [whole];
+  const listed = outlookAccountList(settings);
+  if (listed.length < 2) return [whole];
+  const byAccount = statusByAccount || {};
+  const accounts = listed.map((a) => ({ account: a, listed: true }));
+  const seen = new Set(listed.map((a) => a.accountId));
+  for (const it of items || []) {
+    if (it.source !== source) continue;
+    const id = itemAccountId(it);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    accounts.push({ account: outlookAccountById(settings, id), listed: false });
+  }
+  return accounts.map(({ account: a, listed: isListed }) => ({
+    key: traySectionKey(source, a.accountId),
+    label: isListed ? `${meta.label} · ${a.label}` : `${meta.label} · ${a.accountId} (not listed)`,
+    account: a,
+    configured: isListed && sourceConfigured(outlookAccountView(settings, a), source),
+    status: !isListed ? undefined
+      : a.enabled ? byAccount[a.accountId]
+        : { ok: false, reason: 'disabled', message: `${a.label}: ${OUTLOOK_DISABLED_MESSAGE}`, hint: null, docUrl: null },
+    member: (it) => itemAccountId(it) === a.accountId,
+  }));
+}
+
 /* ---- opening the board should reveal the tray ----------------------------
  *
  * ...but exactly once per session. A user who collapses the right sidebar or
@@ -11528,56 +11591,61 @@ class PlannerTrayView extends ItemView {
       // In the all-cold state the synced heads are replaced by the lead block.
       if (key !== MANUAL_SOURCE && conn.allCold) continue;
 
-      const meta = SOURCES[key];
-      const configured = sourceConfigured(resolved, key);
-      const st = this.plugin.syncStatus[key];
-      const list = items
-        .filter((i) => i.source === key && !i.plannedDay && !isDone(i) && !i.weeklyGoal)
-        .sort((a, b) => {
-          const br = bucketRank[dueBucketOf(a.due, today)] - bucketRank[dueBucketOf(b.due, today)];
-          if (br) return br;
-          if (a.priority !== b.priority) return a.priority - b.priority;
-          return (a.due || '9999').localeCompare(b.due || '9999');
+      // One section per source, or one per account of the source with
+      // accounts when more than one is listed (traySourceSections). `part`
+      // is what differs: the head label, the membership, the collapse key,
+      // the configured answer and the status row it reads.
+      for (const part of traySourceSections(resolved, key, items, this.plugin.syncStatusByAccount)) {
+        const configured = part.configured;
+        const st = part.account ? part.status : this.plugin.syncStatus[key];
+        const list = items
+          .filter((i) => i.source === key && part.member(i) && !i.plannedDay && !isDone(i) && !i.weeklyGoal)
+          .sort((a, b) => {
+            const br = bucketRank[dueBucketOf(a.due, today)] - bucketRank[dueBucketOf(b.due, today)];
+            if (br) return br;
+            if (a.priority !== b.priority) return a.priority - b.priority;
+            return (a.due || '9999').localeCompare(b.due || '9999');
+          });
+
+        const sec = el.createDiv({ cls: 'iplan-tray-section' });
+        const headRow = sec.createDiv({ cls: 'iplan-tray-section-head is-clickable' });
+        headRow.appendChild(sourceMarkEl(key));
+        headRow.createSpan({ text: ` ${part.label.toUpperCase()}` });
+        headRow.createSpan({ cls: 'iplan-tray-count', text: String(list.length) });
+        const body = sec.createDiv({ cls: 'iplan-tray-section-body' });
+        if (this.collapsed[part.key]) sec.addClass('is-collapsed');
+        headRow.addEventListener('click', () => {
+          this.collapsed[part.key] = !this.collapsed[part.key];
+          sec.classList.toggle('is-collapsed', this.collapsed[part.key]);
         });
 
-      const sec = el.createDiv({ cls: 'iplan-tray-section' });
-      const headRow = sec.createDiv({ cls: 'iplan-tray-section-head is-clickable' });
-      headRow.appendChild(sourceMarkEl(key));
-      headRow.createSpan({ text: ` ${meta.label.toUpperCase()}` });
-      headRow.createSpan({ cls: 'iplan-tray-count', text: String(list.length) });
-      const body = sec.createDiv({ cls: 'iplan-tray-section-body' });
-      if (this.collapsed[key]) sec.addClass('is-collapsed');
-      headRow.addEventListener('click', () => {
-        this.collapsed[key] = !this.collapsed[key];
-        sec.classList.toggle('is-collapsed', this.collapsed[key]);
-      });
-
-      // The one authority on what this section is allowed to claim.
-      const total = key === MANUAL_SOURCE
-        ? items.filter((i) => i.source === MANUAL_SOURCE).length
-        : undefined;
-      const state = trayEmptyState(key, configured, st, list.length, total, resolved.secretsInStore === true);
-      if (state && (state.kind === 'unconfigured' || state.kind === 'unconfigured-device')) {
-        const note = body.createDiv({ cls: 'iplan-tray-note is-unconfigured' });
-        note.createSpan({ text: state.text });
-        const connect = note.createEl('button', {
-          cls: 'iplan-action',
-          attr: { type: 'button', 'aria-label': `Connect ${meta.label}` },
-          text: state.kind === 'unconfigured-device' ? TRAY_COPY.connectDeviceAction : TRAY_COPY.connectAction,
-        });
-        connect.addEventListener('click', () => this.plugin.openPluginSettings());
-      } else if (state) {
-        const note = body.createDiv({ cls: 'iplan-tray-note', text: state.text });
-        if (state.hint) {
-          const hintEl = note.createDiv({ cls: 'iplan-tray-note-hint', text: state.hint });
-          if (state.docUrl) {
-            hintEl.appendText(' ');
-            const a = hintEl.createEl('a', { text: 'Open', href: state.docUrl });
-            a.addEventListener('click', (e) => { e.preventDefault(); window.open(state.docUrl, '_external'); });
+        // The one authority on what this section is allowed to claim.
+        const total = key === MANUAL_SOURCE
+          ? items.filter((i) => i.source === MANUAL_SOURCE).length
+          : undefined;
+        const state = trayEmptyState(key, configured, st, list.length, total, resolved.secretsInStore === true);
+        if (state && (state.kind === 'unconfigured' || state.kind === 'unconfigured-device')) {
+          const note = body.createDiv({ cls: 'iplan-tray-note is-unconfigured' });
+          note.createSpan({ text: state.text });
+          const connect = note.createEl('button', {
+            cls: 'iplan-action',
+            attr: { type: 'button', 'aria-label': `Connect ${part.label}` },
+            text: state.kind === 'unconfigured-device' ? TRAY_COPY.connectDeviceAction : TRAY_COPY.connectAction,
+          });
+          connect.addEventListener('click', () => this.plugin.openPluginSettings());
+        } else if (state) {
+          const note = body.createDiv({ cls: 'iplan-tray-note', text: state.text });
+          if (state.hint) {
+            const hintEl = note.createDiv({ cls: 'iplan-tray-note-hint', text: state.hint });
+            if (state.docUrl) {
+              hintEl.appendText(' ');
+              const a = hintEl.createEl('a', { text: 'Open', href: state.docUrl });
+              a.addEventListener('click', (e) => { e.preventDefault(); window.open(state.docUrl, '_external'); });
+            }
           }
         }
+        for (const it of list) body.appendChild(renderCard(this.plugin, it, 'tray', this));
       }
-      for (const it of list) body.appendChild(renderCard(this.plugin, it, 'tray', this));
     }
 
     const foot = el.createDiv({ cls: 'iplan-tray-foot' });
@@ -12835,4 +12903,6 @@ module.exports.__test = {
   outlookAccountsNeedingWrite, outlookWriteConsentNotice, outlookProbeGone, shadowedByOtherAccount, anchoredShadowIds, sourceConnected,
   // more than one Microsoft account: the calendar feed per account (#38, part 3)
   graphFeedId, graphFeedAccountId, outlookFeedView, outlookFeedReady,
+  // more than one Microsoft account: the tray by account (#38, part 4)
+  OUTLOOK_DISABLED_MESSAGE, traySectionKey, traySourceSections, PlannerTrayView,
 };
