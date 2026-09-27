@@ -7975,6 +7975,10 @@ class IcorPlannerPlugin extends Plugin {
     const { verifier, challenge } = await pkcePair();
     const state = randomState();
     const url = authorizeUrl({ clientId, tenant, scopes, redirectUri: OUTLOOK_REDIRECT_URI, state, challenge });
+    // One sign-in in flight: starting this one forgets any other, so a
+    // reply from an older browser tab (which may name another account)
+    // fails the state check instead of landing on the wrong keys.
+    this.outlookClearPending();
     const pending = this.outlookRememberPending({ state, verifier, clientId, tenant, scopes, accountId: account.accountId, onDone: typeof o.onDone === 'function' ? o.onDone : null });
     if (this._outlookModal) this._outlookModal.close();
     const title = account.accountId === OUTLOOK_DEFAULT_ACCOUNT ? 'Sign in to Outlook' : `Sign in to Outlook (${account.label})`;
@@ -7989,7 +7993,9 @@ class IcorPlannerPlugin extends Plugin {
   async outlookAuthCallback(params, deps) {
     const state = trimmed(params && params.state);
     const pending = state ? this.outlookSweepPending().get(state) || null : null;
-    const modal = this._outlookModal;
+    // Only the dialog opened for this sign-in hears about it; a reply for
+    // any other sign-in speaks through a Notice.
+    const modal = this._outlookModal && pending && this._outlookModal.pending === pending ? this._outlookModal : null;
     const parsed = parseAuthCallback(params, pending ? pending.state : null);
     if (!parsed.ok) {
       const text = `Outlook sign-in failed: ${parsed.message}`;
@@ -8049,7 +8055,7 @@ class IcorPlannerPlugin extends Plugin {
     ensureGraphCalendarFeed(this.settings);
     delete this.syncStatus.outlook;
     await this.saveSettings();
-    if (this._outlookModal) { this._outlookModal.close(); this._outlookModal = null; }
+    this.outlookCloseModalFor(pending);
     new Notice(`Planner: signed in to Outlook${account ? ` as ${account}` : ''}.`);
     if (pending && pending.onDone) pending.onDone();
     this.syncNow(false);
@@ -8072,9 +8078,17 @@ class IcorPlannerPlugin extends Plugin {
     } catch { /* the account line is a nicety; the tokens are what matter */ }
     writeSecret(this.settings, this.secrets, outlookAccountField(id, 'outlookAccount'), account || 'Microsoft account');
     await this.saveSettings();
-    if (this._outlookModal) { this._outlookModal.close(); this._outlookModal = null; }
+    this.outlookCloseModalFor(pending);
     new Notice(`Planner: signed in to Outlook (${label})${account ? ` as ${account}` : ''}. Syncing this account comes with a later update.`);
     if (pending.onDone) pending.onDone();
+  }
+  // The sign-in dialog closes for the sign-in it was opened for and for no
+  // other: a finished older sign-in never takes a newer dialog down.
+  outlookCloseModalFor(pending) {
+    const modal = this._outlookModal;
+    if (!modal || !pending || modal.pending !== pending) return;
+    modal.close();
+    if (this._outlookModal === modal) this._outlookModal = null;
   }
 
   // Sign-out clears the four vault keys and the granted scopes. The notes
@@ -11990,6 +12004,10 @@ class IcorPlannerSettingTab extends PluginSettingTab {
     acct.descEl.setAttribute('aria-live', 'polite');
     let signInBtn = null;
     let signOutBtn = null;
+    // The further rows refresh with the default row (a typed client id
+    // enables every Sign in), from the one resolved copy, and without a
+    // re-render, which would take the focus out of the text box.
+    const accountRefreshers = [];
     const renderOutlookStatus = () => {
       const r = this.plugin.withSecrets();
       acct.setDesc(outlookStatusText(r));
@@ -12000,6 +12018,7 @@ class IcorPlannerSettingTab extends PluginSettingTab {
         if (!signed) signInBtn.setCta(); else signInBtn.removeCta();
       }
       if (signOutBtn) signOutBtn.setDisabled(!signed);
+      for (const refresh of accountRefreshers) refresh(r);
     };
     acct.addButton((b) => {
       signInBtn = b;
@@ -12012,26 +12031,36 @@ class IcorPlannerSettingTab extends PluginSettingTab {
         this.display();
       });
     });
-    renderOutlookStatus();
     // One row per further Microsoft account (#38, part 2): the same
     // sign-in through the same app registration, its own token set, its
     // own sign-out. Nothing syncs a further account yet.
     for (const account of accounts.slice(1)) {
       const row = new Setting(containerEl).setName(`Microsoft account: ${account.label}`);
       row.descEl.setAttribute('aria-live', 'polite');
-      const view = outlookAccountView(this.plugin.withSecrets(), account);
-      const signed = outlookSignedIn(view);
-      row.setDesc(`${outlookStatusText(view)}${signed ? ' Syncing this account comes with a later update.' : ''}`);
+      let inBtn = null;
+      let outBtn = null;
       row.addButton((b) => {
-        b.setButtonText(signed ? 'Sign in again' : 'Sign in').setDisabled(!trimmed(view.outlookClientId));
-        if (!signed) b.setCta();
+        inBtn = b;
         b.onClick(() => this.plugin.outlookSignIn({ accountId: account.accountId, onDone: () => this.display() }));
       });
-      row.addButton((b) => b.setButtonText('Sign out').setDisabled(!signed).onClick(async () => {
-        await this.plugin.outlookSignOut(account.accountId);
-        this.display();
-      }));
+      row.addButton((b) => {
+        outBtn = b;
+        b.setButtonText('Sign out').onClick(async () => {
+          await this.plugin.outlookSignOut(account.accountId);
+          this.display();
+        });
+      });
+      accountRefreshers.push((r) => {
+        const view = outlookAccountView(r, account);
+        const signed = outlookSignedIn(view);
+        row.setDesc(`${outlookStatusText(view)}${signed ? ' Syncing this account comes with a later update.' : ''}`);
+        inBtn.setButtonText(signed ? 'Sign in again' : 'Sign in');
+        inBtn.setDisabled(!trimmed(view.outlookClientId));
+        if (!signed) inBtn.setCta(); else inBtn.removeCta();
+        outBtn.setDisabled(!signed);
+      });
     }
+    renderOutlookStatus();
     const revoke = new Setting(containerEl)
       .setName('Manage or revoke access')
       .setDesc('Signing out only removes the token from this vault. To fully revoke access on Microsoft\'s side, visit myaccount.microsoft.com (Apps & services), or account.live.com/consent/Manage for a personal account.');

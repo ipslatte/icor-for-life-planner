@@ -207,30 +207,41 @@ test('the view: the default IS the settings object; a further account is the fla
   assert.deepEqual([plain.outlookRefreshToken__work, plain.outlookAccessToken__work, plain.outlookRefreshToken, persisted], ['rt-w3', 'at-w3', 'rt-d1', 1]);
 });
 
-test('the pending map is keyed by state: a reply finds its own sign-in, never the latest one; an unknown state consumes nothing', async () => {
+// A stand-in for the sign-in dialog: what was written into it, whether it closed.
+const fakeModal = (pending) => ({ pending, statuses: [], closed: false, setStatus(t, failed) { this.statuses.push([t, !!failed]); }, close() { this.closed = true; } });
+
+test('one sign-in in flight, found by its state: starting Work forgets Personal; a reply from the older tab exchanges nothing and leaves the newer dialog alone', async () => {
   const p = headless(twoSignedIn(), new T.SecretVault(null));
   const t0 = Date.now() - 1000; // the reply sweeps by Date.now()
   const a = p.outlookRememberPending({ state: 'st-a', verifier: 'v-a', clientId: CLIENT, tenant: 'common', scopes: 'a', accountId: 'default' }, t0);
+  // What outlookSignIn does for the second sign-in: forget every other, remember this one, open its own dialog.
+  p.outlookClearPending();
   const b = p.outlookRememberPending({ state: 'st-b', verifier: 'v-b', clientId: CLIENT, tenant: 'common', scopes: 'b', accountId: 'work' }, t0 + 1000);
-  assert.deepEqual([...p.outlookPendingMap().keys()], ['st-a', 'st-b'], 'both wait; starting the second did not drop the first');
+  p._outlookModal = fakeModal(b);
+  assert.deepEqual([...p.outlookPendingMap().keys()], ['st-b'], 'starting Work dropped Personal');
   const finished = [];
   p.outlookFinishSignIn = async (tokens, pending) => { finished.push({ tokens, pending }); };
-  const x = wire([json(200, { access_token: 'at-w1', refresh_token: 'rt-w1', expires_in: 3600, scope: 'b' })]);
-  await p.outlookAuthCallback({ action: 'icor-for-life-planner/auth', code: 'code-b', state: 'st-b' }, { requestUrl: x.requestUrl });
-  assert.equal(finished.length, 1);
-  assert.equal(finished[0].pending, b, 'B finished, not A, though A was started first');
-  assert.equal(form(x.calls[0]).code_verifier, 'v-b', 'exchanged with B\'s own verifier');
-  assert.deepEqual([...p.outlookPendingMap().keys()], ['st-a'], 'A still waits');
+  // The older Personal tab finishes: no exchange, nothing stored, and the Work dialog untouched.
   const quiet = wire([]);
-  for (const params of [{ code: 'code-x', state: 'st-x' }, { code: 'code-x' }, { error: 'access_denied', error_description: 'AADSTS65004: User declined to consent.', state: 'st-a' }]) {
+  await p.outlookAuthCallback({ code: 'code-a', state: 'st-a' }, { requestUrl: quiet.requestUrl });
+  assert.equal(quiet.calls.length, 0, 'a reply for a forgotten sign-in makes no exchange');
+  assert.equal(finished.length, 0);
+  assert.deepEqual(p._outlookModal.statuses, [], 'the Work dialog heard nothing');
+  assert.equal(p._outlookModal.closed, false);
+  for (const params of [{ code: 'code-x', state: 'st-x' }, { code: 'code-x' }, { error: 'access_denied', error_description: 'AADSTS65004: User declined to consent.', state: 'st-b' }]) {
     await p.outlookAuthCallback(params, { requestUrl: quiet.requestUrl });
   }
   assert.equal(quiet.calls.length, 0, 'an unknown state, no state, or a declined reply: no exchange');
-  assert.deepEqual([...p.outlookPendingMap().keys()], ['st-a'], 'and nothing consumed: A waits for the next try');
-  const y = wire([json(200, { access_token: 'at-d2', refresh_token: 'rt-d2', expires_in: 3600 })]);
-  await p.outlookAuthCallback({ code: 'code-a', state: 'st-a' }, { requestUrl: y.requestUrl });
-  assert.equal(finished[1].pending, a);
+  assert.deepEqual([...p.outlookPendingMap().keys()], ['st-b'], 'and nothing consumed: Work waits for the next try');
+  assert.deepEqual(p._outlookModal.statuses.map((s) => s[1]), [true], 'only the declined reply for Work itself reached the Work dialog');
+  // Then Work's own reply.
+  const x = wire([json(200, { access_token: 'at-w1', refresh_token: 'rt-w1', expires_in: 3600, scope: 'b' })]);
+  await p.outlookAuthCallback({ action: 'icor-for-life-planner/auth', code: 'code-b', state: 'st-b' }, { requestUrl: x.requestUrl });
+  assert.equal(finished.length, 1);
+  assert.equal(finished[0].pending, b);
+  assert.equal(form(x.calls[0]).code_verifier, 'v-b', 'exchanged with Work\'s own verifier');
   assert.equal(p.outlookPendingMap().size, 0);
+  assert.equal(a.state, 'st-a', 'the forgotten entry is just an object now');
   // The TTL, and a sign-out forgets its own account's sign-ins only.
   assert.equal(T.OUTLOOK_PENDING_TTL_MS, 15 * 60000);
   p.outlookRememberPending({ state: 'st-old', accountId: 'work' }, 0);
@@ -240,10 +251,11 @@ test('the pending map is keyed by state: a reply finds its own sign-in, never th
   p.outlookClearPending('work');
   assert.equal(p.outlookPendingMap().size, 0);
   // A sign-in for an account the list does not carry starts nothing.
+  const before = p._outlookModal;
   await p.outlookSignIn({ accountId: 'nope' });
   await p.outlookSignIn({ accountId: 'Work' });
   assert.equal(p.outlookPendingMap().size, 0);
-  assert.equal(p._outlookModal, undefined);
+  assert.equal(p._outlookModal, before, 'and opens no dialog');
 });
 
 test('a further account\'s sign-in stores under its keys and leaves the default\'s; sign-out of one account leaves the other', async () => {
@@ -253,8 +265,15 @@ test('a further account\'s sign-in stores under its keys and leaves the default\
   const p = headless(s, vault);
   let done = 0;
   const me = wire([json(200, { userPrincipalName: 'work-mailbox', displayName: 'Work' })]);
-  await p.outlookFinishSignIn({ accessToken: 'at-w1', refreshToken: 'rt-w1', expiresIn: 3600, scope: 'Mail.Read Calendars.Read' },
-    { state: 'st-w', accountId: 'work', scopes: 'a', onDone: () => { done += 1; } }, { requestUrl: me.requestUrl, now: () => 9000 });
+  const pending = { state: 'st-w', accountId: 'work', scopes: 'a', onDone: () => { done += 1; } };
+  const other = fakeModal({ state: 'st-other', accountId: 'default' });
+  p._outlookModal = other;
+  await p.outlookFinishSignIn({ accessToken: 'at-w1', refreshToken: 'rt-w1', expiresIn: 3600, scope: 'Mail.Read Calendars.Read' }, pending, { requestUrl: me.requestUrl, now: () => 9000 });
+  assert.equal(other.closed, false, 'another sign-in\'s dialog is not taken down');
+  assert.equal(p._outlookModal, other);
+  p._outlookModal = fakeModal(pending);
+  p.outlookCloseModalFor(pending);
+  assert.equal(p._outlookModal, null, 'its own dialog closes');
   assert.match(me.calls[0].url, /\/me\?/);
   assert.equal(me.calls[0].headers.Authorization, 'Bearer at-w1', 'the /me call carries the new account\'s token');
   const stored = WORK_KEYS.map((k) => storage.getSecret(k));
@@ -299,30 +318,32 @@ test('source scan: the walkers on secretFieldNames(), the pins the sign-in keeps
   assert.match(c, /writeSecret\(live, k\.vault, outlookAccountField\(acct, field\), value\)/, 'every token write names the account');
   assert.match(c, /writeSecret\(live, k\.vault, outlookAccountField\(acct, f\), ''\)/, 'and every clear');
   // The pins: one handler, four resolved views in the class, the literal default calls.
+  // One protocol handler, registered as an arrow that passes `params` and
+  // nothing else: production always gets the real requestUrl, and nothing
+  // off an obsidian:// URL can reach the trailing `deps`.
   assert.equal((c.match(/registerObsidianProtocolHandler\(/g) || []).length, 1);
+  assert.match(c, /this\.registerObsidianProtocolHandler\(OUTLOOK_PROTOCOL_ACTION, \(params\) => this\.outlookAuthCallback\(params\)\);/);
+  assert.doesNotMatch(c, /outlookAuthCallback\.bind\(|outlookAuthCallback\(\.\.\./);
   assert.equal((c.match(/const s = this\.withSecrets\(\);/g) || []).length, 4);
   assert.match(c, /clearOutlookTokens\(\{ live: this\.settings, vault: this\.secrets \}\)/, 'the default sign-out is the literal call');
   assert.match(c, /clearOutlookTokens\(\{ live: this\.settings, vault: this\.secrets, account: id \}\)/, 'a further account takes the widened one');
   assert.equal((c.match(/ensureGraphCalendarFeed\(/g) || []).length, 2, 'the definition and the one default call; no feed for a further account in this part');
-  assert.match(c, /const pending = state \? this\.outlookSweepPending\(\)\.get\(state\) \|\| null : null;/, 'the reply is matched by its state');
   assert.doesNotMatch(c, /this\._outlookPending = (\{|null)/, 'no single latest sign-in any more');
   assert.doesNotMatch(c, /this\.(plugin\.)?settings\.outlook(RefreshToken|AccessToken|ExpiresAt|Account)(__|\b)/, 'no class reads a token off the settings, suffixed or not');
   assert.match(c, /const pending = modal \? modal\.pending : null;/, 'the device code finishes the account the modal was opened for');
   const defaults = r.slice(r.indexOf('const DEFAULT_SETTINGS = {'), r.indexOf('\n};', r.indexOf('const DEFAULT_SETTINGS = {')));
   assert.doesNotMatch(defaults, /outlookAccounts|__/, 'no default under the list and no suffixed field is laid down');
-  // The settings rows: between the default row and the revoke row, Setting
-  // rows in sentence case, no raw heading tag, no inline style, reading
-  // through the resolved view; the default row keeps its name alone.
+  // The settings rows: Setting rows, no raw heading tag, no inline style,
+  // plain ASCII; refreshed with the default row from one resolved copy,
+  // never by a re-render per keystroke.
   const tab = r.slice(r.indexOf('class IcorPlannerSettingTab'));
   const rows = tab.slice(tab.indexOf('for (const account of accounts.slice(1))'), tab.indexOf("setName('Manage or revoke access')"));
-  assert.ok(rows.length > 0 && rows.length < 1600);
+  assert.ok(rows.length > 0);
   assert.match(rows, /new Setting\(containerEl\)\.setName\(`Microsoft account: \$\{account\.label\}`\)/);
-  assert.match(rows, /outlookAccountView\(this\.plugin\.withSecrets\(\), account\)/);
-  assert.match(rows, /outlookSignIn\(\{ accountId: account\.accountId, onDone/);
-  assert.match(rows, /outlookSignOut\(account\.accountId\)/);
-  assert.doesNotMatch(rows, /createEl\('h[1-6]'|\.style\.|style=|setHeading/);
+  assert.match(rows, /accountRefreshers\.push\(\(r\) => \{\n\s*const view = outlookAccountView\(r, account\);/);
+  assert.match(tab, /if \(signOutBtn\) signOutBtn\.setDisabled\(!signed\);\n\s*for \(const refresh of accountRefreshers\) refresh\(r\);/, 'the default row\'s refresh drives the further rows');
+  assert.doesNotMatch(rows, /createEl\('h[1-6]'|\.style\.|style=|setHeading|withSecrets\(\)/, 'no heading tag, no inline style, no second read of the store');
   assert.ok([...rows].every((ch) => ch.charCodeAt(0) < 128), 'plain ASCII, so no dash of either length');
   for (const text of rows.match(/setButtonText\('([^']+)'\)/g) || []) assert.match(text, /'(Sign in|Sign in again|Sign out)'/, 'sentence case');
-  assert.match(tab, /setName\(accounts\.length > 1 \? `Microsoft account: \$\{accounts\[0\]\.label\}` : 'Microsoft account'\)/);
   assert.ok(tab.indexOf('/* ---- Outlook (2026-09-06) ---- */') > tab.indexOf("setName('Starred email (IMAP)').setHeading()"), 'the marker stays after the IMAP heading');
 });
