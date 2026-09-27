@@ -345,6 +345,6 @@ test('source scan: the walkers on secretFieldNames(), the pins the sign-in keeps
   assert.match(tab, /if \(signOutBtn\) signOutBtn\.setDisabled\(!signed\);\n\s*for \(const refresh of accountRefreshers\) refresh\(r\);/, 'the default row\'s refresh drives the further rows');
   assert.doesNotMatch(rows, /createEl\('h[1-6]'|\.style\.|style=|setHeading|withSecrets\(\)/, 'no heading tag, no inline style, no second read of the store');
   assert.ok([...rows].every((ch) => ch.charCodeAt(0) < 128), 'plain ASCII, so no dash of either length');
-  for (const text of rows.match(/setButtonText\('([^']+)'\)/g) || []) assert.match(text, /'(Sign in|Sign in again|Sign out)'/, 'sentence case');
+  for (const text of rows.match(/setButtonText\('([^']+)'\)/g) || []) assert.match(text, /'(Sign in|Sign in again|Sign out|Add)'/, 'sentence case (Add is part 4b\'s row, after the account rows)');
   assert.ok(tab.indexOf('/* ---- Outlook (2026-09-06) ---- */') > tab.indexOf("setName('Starred email (IMAP)').setHeading()"), 'the marker stays after the IMAP heading');
 });

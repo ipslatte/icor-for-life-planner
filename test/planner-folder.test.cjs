@@ -124,7 +124,7 @@ test('the literal default appears exactly once in code, and no constant path sur
   assert.doesNotMatch(c, /CALENDAR_CACHE_FILE/, 'the cache path derives from the setting');
   assert.doesNotMatch(c, /startsWith\(PLANNER_FOLDER/, 'no prefix test against the constant');
   assert.equal((c.match(/collectItems\(this\.app, this\.paths\(\)\.root\)/g) || []).length, 1, 'the sync collects from the setting');
-  assert.equal((c.match(/collectItems\(this\.plugin\.app, this\.plugin\.paths\(\)\.root\)/g) || []).length, 2, 'the board and the tray collect from the setting');
+  assert.equal((c.match(/collectItems\(this\.plugin\.app, this\.plugin\.paths\(\)\.root\)/g) || []).length, 3, 'the board, the tray and the settings tab (the account id lock, part 4b) collect from the setting');
   // 0.9.2: the file-tree click hook is gone (the folder opens like any
   // folder), so no code builds a selector from the folder path any more.
   assert.doesNotMatch(c, /data-path="\$\{this\.paths\(\)\.root\}"/, 'the retired file-tree click hook is back');
