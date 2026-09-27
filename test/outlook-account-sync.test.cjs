@@ -24,6 +24,9 @@
  *   - a listed account never signed in answers degraded, never empty;
  *   - Complete on source names every further account lacking the write
  *     permission; a disabled default keeps its feed and its sign-in;
+ *   - a note that lost its stamp: the default's run leaves it alone when
+ *     the shadow map already keys its id under another listed account,
+ *     and never writes the stamp back; one account listed changes nothing;
  *   - source scan: the pins the sync core keeps.
  *
  * Fixtures are invented: token strings of the shape `at-w1`, a client id of
@@ -470,6 +473,74 @@ test('Complete on source: every further account lacking the write permission is 
   // The row's status line is what says "sign in again" for a further account, per account.
   assert.match(T.outlookStatusText(T.outlookAccountView(w, 'work')), /Signed in as Work mailbox\. Flag changes need one more permission/);
   assert.equal(T.outlookStatusText(T.outlookAccountView(T.withSecrets(settingsFor(THREE), null), 'work')), 'Signed in as Work mailbox.');
+});
+
+test('a note that lost its stamp is left alone by the default\'s run when its id is already keyed under another listed account, and the stamp is never written back; one account listed changes nothing', async () => {
+  // w1 came from the work mailbox and lost its stamp line (a frontmatter
+  // tidy-up, a repair that dropped a field it did not list); o1 the same for
+  // the switched-off account. Both now read as the default's. The default
+  // mailbox does not have them, so without the guard the run marks them
+  // done, asks the default mailbox about another mailbox's ids, and trashes
+  // them on the 404, planning and all. The shadow map still keys each id
+  // under its own account, so the plugin knows better. wr is the same loss
+  // on a note with a pending reopen, the other path that writes to the
+  // mailbox and trashes on a 404.
+  const d1 = note('d1'); const d2 = note('d2');
+  const w1 = note('w1', { planned_day: '2026-09-28', linked_note: 'Notes/Brief' });
+  const o1 = note('o1');
+  const wr = note('wr', { status: 'done', done_local: false, reopen_pending: true });
+  const shadows = { 'outlook:d1': sh(), 'outlook:d2': sh(), 'outlook@work:w1': sh(), 'outlook@old:o1': sh(), 'outlook@work:wr': sh({ done: true }) };
+  const { p, trashed, created } = plugin(settingsFor(THREE, { _shadow: shadows }), [d1, d2, w1, o1, wr]);
+  const before = JSON.stringify([w1.fm, o1.fm, wr.fm]);
+  await recording(async (log) => {
+    await p.upsertSource('outlook', { ok: true, items: [mail('d1')], account: 'default' });
+    assert.deepEqual(trashed, [d2.path], 'the default\'s own vanished note still goes, as before');
+    assert.deepEqual(log.probed, [['d2', 'default']], 'w1, o1 and wr were never asked of the default mailbox');
+    assert.deepEqual(log.closed, [], 'wr\'s pending reopen is not the default\'s to send');
+    assert.equal(JSON.stringify([w1.fm, o1.fm, wr.fm]), before, 'left exactly as they were: not done, not trashed, no stamp written back');
+    assert.ok(p.settings._shadow['outlook@work:w1'] && p.settings._shadow['outlook@old:o1'] && p.settings._shadow['outlook@work:wr'], 'their shadows stay under their own keys');
+    assert.equal(p.settings._shadow['outlook:w1'], undefined, 'and nothing is written under the default\'s');
+    assert.equal(created.length, 0);
+    // Work's run is unchanged: an unstamped note is not its either, so w1
+    // stays as it is and the mailbox's copy is created stamped. The member
+    // sees two cards for one mail and puts the stamp back by hand; nothing
+    // was lost on the way.
+    await p.upsertSource('outlook', { ok: true, items: [mail('w1')], account: 'work' });
+    assert.deepEqual(trashed, [d2.path]);
+    assert.equal(JSON.stringify([w1.fm, o1.fm, wr.fm]), before);
+    assert.equal(created.length, 1);
+    assert.match(created[0].content, /^source_account: "work"$/m);
+  }, { probe: () => true });
+  // The predicate on its own: only an unstamped note of the source with
+  // accounts, only a key under a LISTED account (switched off counts; an id
+  // nothing lists does not), and never a stamped note, whose stamp is its
+  // identity whatever the map says.
+  const s = settingsFor(THREE, { _shadow: shadows });
+  const it = (id, over) => Object.assign({ source: 'outlook', id }, over || {});
+  assert.equal(T.shadowedByOtherAccount(s, shadows, 'outlook', it('w1')), true);
+  assert.equal(T.shadowedByOtherAccount(s, shadows, 'outlook', it('o1')), true, 'listed and switched off still counts');
+  assert.equal(T.shadowedByOtherAccount(s, shadows, 'outlook', it('d1')), false);
+  assert.equal(T.shadowedByOtherAccount(s, shadows, 'outlook', it('n1')), false, 'no shadow anywhere: the default\'s, as before');
+  assert.equal(T.shadowedByOtherAccount(s, shadows, 'outlook', it('w1', { sourceAccount: 'work' })), false, 'stamped: the stamp decides');
+  assert.equal(T.shadowedByOtherAccount(s, shadows, 'outlook', it('w1', { sourceAccount: 'old' })), false);
+  assert.equal(T.shadowedByOtherAccount(s, { 'outlook@gone:g1': sh() }, 'outlook', it('g1')), false, 'an account nothing lists is not looked under');
+  assert.equal(T.shadowedByOtherAccount(s, { 'todoist@work:t1': sh() }, 'todoist', it('t1', { source: 'todoist' })), false, 'no other source has accounts');
+  assert.equal(T.shadowedByOtherAccount(s, null, 'outlook', it('w1')), false);
+  assert.equal(T.shadowedByOtherAccount(s, shadows, 'outlook', null), false);
+  // One account listed, either shape: there is no other key to look under,
+  // so a stray `outlook@work:` shadow (an account removed from the list)
+  // changes nothing and the run is byte for byte what it always was.
+  for (const accounts of [null, [{ accountId: 'default', label: 'Personal' }]]) {
+    const x1 = note('x1');
+    const { p: q, trashed: t } = plugin(settingsFor(accounts, { _shadow: { 'outlook@work:x1': sh() } }), [x1]);
+    assert.equal(T.shadowedByOtherAccount(q.settings, q.settings._shadow, 'outlook', it('x1')), false);
+    await recording(async (log) => {
+      await q.upsertSource('outlook', { ok: true, items: [mail('d1')], account: 'default' });
+      assert.deepEqual(log.probed, [['x1', 'default']]);
+      assert.deepEqual(t, [x1.path]);
+    }, { probe: () => true });
+  }
+  assert.match(code(), /const ownsNote = \(it\) => stampedForRun\(it\) && !shadowedByOtherAccount\(s, s\._shadow, source, it\);/, 'the guard is folded into ownsNote, so the existing map, the reconcile predicate and the reopen retry all read it');
 });
 
 test('source scan: the pins the sync core keeps, and every shadow key in the class goes through shadowKey', () => {

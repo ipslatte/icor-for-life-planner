@@ -2610,6 +2610,27 @@ function shadowPrefix(source, accountId) {
   const a = accountId == null || accountId === '' ? OUTLOOK_DEFAULT_ACCOUNT : String(accountId);
   return a === OUTLOOK_DEFAULT_ACCOUNT ? `${source}:` : `${source}@${a}:`;
 }
+// A note with no stamp reads as the default's, and that is the one reading
+// this file INFERS rather than reads. When the shadow map already keys that
+// id under another LISTED account (`outlook@work:id`), the plugin knows the
+// note came from that mailbox and its stamp was lost (a frontmatter tidy-up,
+// a repair that dropped a field it did not list). True here means the
+// default's run must leave the note alone: reconciling it would mark it
+// done, ask the default mailbox about another mailbox's id, and trash the
+// note on the 404, planning and all. The stamp is NOT written back: the
+// shadow is a cache, never the note's identity, and the stamp has one
+// writer, the create. Only an unstamped note of the source with accounts
+// can answer true, and with one account listed there is no other key to
+// look under, so nothing changes for a one-account vault.
+function shadowedByOtherAccount(settings, shadowMap, source, item) {
+  if (!sourceHasAccounts(source) || !item || itemAccountId(item) !== OUTLOOK_DEFAULT_ACCOUNT) return false;
+  const map = shadowMap || {};
+  for (const a of outlookAccountList(settings)) {
+    if (a.accountId === OUTLOOK_DEFAULT_ACCOUNT) continue;
+    if (map[shadowKey(source, a.accountId, item.id)]) return true;
+  }
+  return false;
+}
 // The runs beyond the first: one per further ENABLED account, each on its
 // own view. The default is the run syncNow already makes from the registry
 // and is not here. An account switched off contributes no run and is
@@ -7768,9 +7789,14 @@ class IcorPlannerPlugin extends Plugin {
     // The notes this run owns: for the source with accounts, exactly the
     // notes stamped for its account (no stamp is the default's); for every
     // other source, all of its notes, whatever a stray stamp says.
-    const ownsNote = (it) => !hasAccounts || itemAccountId(it) === (accountId || OUTLOOK_DEFAULT_ACCOUNT);
+    const stampedForRun = (it) => !hasAccounts || itemAccountId(it) === (accountId || OUTLOOK_DEFAULT_ACCOUNT);
     const folder = this.paths().sourceFolder(source);
     const s = this.withSecrets(); // shallow: s._shadow is the live map
+    // Less one case: a note with no stamp whose id the shadow map already
+    // keys under another listed account lost its stamp, and the default's
+    // run leaves it exactly as it is (shadowedByOtherAccount). With one
+    // account listed this is the line above and nothing more.
+    const ownsNote = (it) => stampedForRun(it) && !shadowedByOtherAccount(s, s._shadow, source, it);
     const allItems = collectItems(this.app, this.paths().root);
     const existing = new Map(); // external id -> item
     for (const it of allItems) {
@@ -12713,5 +12739,5 @@ module.exports.__test = {
   outlookSecretAccountIds, secretFieldNames, outlookAccountView,
   // more than one Microsoft account: the sync (#38, part 3)
   sourceHasAccounts, itemShadowAccount, shadowKey, shadowPrefix, outlookExtraRuns, mergeSyncStatus, outlookItemAccount,
-  outlookAccountsNeedingWrite, outlookWriteConsentNotice, outlookProbeGone,
+  outlookAccountsNeedingWrite, outlookWriteConsentNotice, outlookProbeGone, shadowedByOtherAccount,
 };
