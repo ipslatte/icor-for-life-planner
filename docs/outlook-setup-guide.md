@@ -82,5 +82,8 @@ One of the permissions hasn't been consented to yet. Try connecting again and ap
 **My connection stopped working after a while and I'm asked to sign in again.**
 This is normal. Microsoft's tokens expire after a period of inactivity or after a set time. Just click **Sign in** again in the Planner's settings; you'll sign in once more and it picks up where it left off.
 
+**Can I connect more than one Microsoft account?**
+Yes. Under Outlook in the Planner's settings, press **Add account** to list a second Microsoft account, give it a name, and sign it in from its row. Each account syncs its own flagged mail and its own calendar; the tray shows one Outlook section per account and each card names its mailbox. Removing a row signs that account out and removes its calendar; its notes stay in the vault and the tray shows them under "Not in the account list" until you delete or restamp them. An account added again after a removal starts fresh, without its old done history.
+
 **Can I disconnect later?**
 Yes. Click **Sign out** under Outlook in the Planner's settings, which removes the tokens from wherever they live (Obsidian's keychain on Obsidian 1.11.4 or newer, or the env file if you chose that; see the README section "Where your keys live"). To also revoke access on Microsoft's side, visit `myaccount.microsoft.com` (or `account.live.com/consent/Manage` for a personal account) and remove the app from your list of connected apps. The settings tab links to both.

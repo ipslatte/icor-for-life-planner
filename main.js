@@ -2502,9 +2502,9 @@ function outlookAccountIdFromLabel(label) {
   return base === OUTLOOK_DEFAULT_ACCOUNT ? '' : outlookAccountId(base);
 }
 // `base` if free, else `base-2`, `base-3`, ... within the cap; an empty base
-// starts from `account`.
+// starts from `account`. `taken` is a list of ids or a predicate.
 function outlookUniqueAccountId(base, taken) {
-  const has = (id) => (taken || []).includes(id);
+  const has = typeof taken === 'function' ? taken : (id) => (taken || []).includes(id);
   const stem = base || 'account';
   if (!has(stem)) return stem;
   for (let n = 2; n < 1000; n += 1) {
@@ -2533,6 +2533,24 @@ function outlookAccountIdInUse(settings, accountId, items) {
   if (Object.keys(s._shadow || {}).some((k) => k.startsWith(prefix))) return true;
   if (calendarFeeds(s).some((f) => f.kind === 'graph' && graphFeedAccountId(f) === accountId)) return true;
   return (items || []).some((it) => it && sourceHasAccounts(it.source) && itemAccountId(it) === accountId);
+}
+// Whether an id may be GIVEN to a new or renamed account: not while a listed
+// account holds it, and not while anything is left under it (the lock above,
+// plus the store read directly: withSecrets fills an unlisted id's fields
+// from nothing, so a key a removed account left behind, or a sign-in that
+// landed after its removal, is visible only in the store itself). A new
+// account never inherits a removed one's notes, shadows, feed or token; the
+// same mailbox added again gets a fresh id and starts without its old done
+// history, on purpose.
+function outlookAccountIdTaken(settings, vault, accountId, items) {
+  // An id outside the rule, or the reserved one, is never handed out.
+  if (!outlookAccountId(accountId) || accountId === OUTLOOK_DEFAULT_ACCOUNT) return true;
+  if (outlookAccountList(settings).some((a) => a.accountId === accountId)) return true;
+  if (outlookAccountIdInUse(settings, accountId, items)) return true;
+  if (vault && vault.available()) {
+    for (const f of OUTLOOK_ACCOUNT_SECRET_FIELDS) if (vault.get(fieldSecretKey(outlookAccountField(accountId, f)))) return true;
+  }
+  return false;
 }
 
 /* ---- more than one Microsoft account: the sign-in (#38, part 2) ---------
@@ -2800,6 +2818,10 @@ function saveOutlookTokens(sink, tokens, now) {
   const at = (now == null ? Date.now() : now) + Math.max(0, Number(t.expiresIn) || 0) * 1000;
   let held = true;
   const acct = sinkAccount(k);
+  // A further account the live list no longer holds gets nothing written
+  // (#38, part 4b): a run refreshing its token while the member removes the
+  // account would otherwise put a fresh refresh token under a retired id.
+  if (acct !== OUTLOOK_DEFAULT_ACCOUNT && !outlookAccountList(live).some((a) => a.accountId === acct)) return;
   const put = (field, value) => {
     held = writeSecret(live, k.vault, outlookAccountField(acct, field), value) && held;
     if (k.view && k.view !== live) k.view[field] = value;
@@ -8311,7 +8333,11 @@ class IcorPlannerPlugin extends Plugin {
     // reply from an older browser tab (which may name another account)
     // fails the state check instead of landing on the wrong keys.
     this.outlookClearPending();
-    const pending = this.outlookRememberPending({ state, verifier, clientId, tenant, scopes, accountId: account.accountId, onDone: typeof o.onDone === 'function' ? o.onDone : null });
+    // The record itself rides along (part 4b): when the sign-in finishes,
+    // the account must still be listed under this id by this very record,
+    // or the tokens are not stored.
+    const record = outlookAccountRawList(this.settings, false).find((r) => r && typeof r === 'object' && r.accountId === account.accountId) || null;
+    const pending = this.outlookRememberPending({ state, verifier, clientId, tenant, scopes, accountId: account.accountId, record, onDone: typeof o.onDone === 'function' ? o.onDone : null });
     if (this._outlookModal) this._outlookModal.close();
     const title = account.accountId === OUTLOOK_DEFAULT_ACCOUNT ? 'Sign in to Outlook' : `Sign in to Outlook (${account.label})`;
     this._outlookModal = new OutlookSignInModal(this.app, this, { url, pending, title });
@@ -8400,6 +8426,15 @@ class IcorPlannerPlugin extends Plugin {
   // (part 3), which runs that account's mail and calendar on its own view.
   async outlookFinishAccountSignIn(tokens, pending, deps) {
     const id = pending.accountId;
+    // The account must still be listed under this id, by the record the
+    // sign-in was started for (part 4b). A rename that moved the id, or a
+    // removal, during the browser round trip or the token exchange would
+    // otherwise land a live refresh token under an id no row shows.
+    const stillListed = () => {
+      const rec = outlookAccountRawList(this.settings, false).find((r) => r && typeof r === 'object' && r.accountId === id) || null;
+      return !!rec && (!pending.record || rec === pending.record);
+    };
+    if (!stillListed()) { this.outlookRefuseFinish(pending); return; }
     const label = outlookAccountById(this.settings, id).label;
     saveOutlookTokens({ live: this.settings, vault: this.secrets, account: id }, tokens);
     this.settings[outlookAccountField(id, 'outlookScopes')] = trimmed(tokens.scope) || pending.scopes || '';
@@ -8408,6 +8443,14 @@ class IcorPlannerPlugin extends Plugin {
       const me = await graphRequest(outlookAccountView(this.withSecrets(), id), deps, { url: `${GRAPH_BASE}/me?$select=userPrincipalName,mail,displayName` });
       account = trimmed(me.mail) || trimmed(me.userPrincipalName) || trimmed(me.displayName);
     } catch { /* the account line is a nicety; the tokens are what matter */ }
+    // Gone during /me: the tokens just stored leave again, no feed is made.
+    if (!stillListed()) {
+      clearOutlookTokens({ live: this.settings, vault: this.secrets, account: id });
+      for (const f of OUTLOOK_ACCOUNT_FIELDS) delete this.settings[outlookAccountField(id, f)];
+      await this.saveSettings();
+      this.outlookRefuseFinish(pending);
+      return;
+    }
     writeSecret(this.settings, this.secrets, outlookAccountField(id, 'outlookAccount'), account || 'Microsoft account');
     ensureGraphCalendarFeed(this.settings, id, label);
     delete this.syncStatus.outlook;
@@ -8417,6 +8460,13 @@ class IcorPlannerPlugin extends Plugin {
     new Notice(`Planner: signed in to Outlook (${label})${account ? ` as ${account}` : ''}.`);
     if (pending.onDone) pending.onDone();
     this.syncNow(false);
+  }
+  // A sign-in whose account was renamed or removed while it ran: nothing
+  // stored, the dialog closed, the member told to start again from the row.
+  outlookRefuseFinish(pending) {
+    this.outlookCloseModalFor(pending);
+    new Notice('Planner: the Outlook account was renamed or removed while signing in; sign in again from its row.', 10000);
+    if (pending && pending.onDone) pending.onDone();
   }
   // The sign-in dialog closes for the sign-in it was opened for and for no
   // other: a finished older sign-in never takes a newer dialog down.
@@ -8471,22 +8521,37 @@ class IcorPlannerPlugin extends Plugin {
     if (!rec && accountId === OUTLOOK_DEFAULT_ACCOUNT) { rec = { accountId }; list.unshift(rec); }
     return rec || null;
   }
-  // A new row: labelled "Account <n>", its id derived from that label and
-  // made unique, switched on, not signed in. Returns the id.
-  async addOutlookAccount() {
-    const taken = outlookAccountList(this.settings).map((a) => a.accountId);
-    const label = `Account ${taken.length + 1}`;
-    const id = outlookUniqueAccountId(outlookAccountIdFromLabel(label), taken);
+  // The ids a new or renamed account may not take (outlookAccountIdTaken),
+  // read once on the resolved copy and the store. `items` is the vault's
+  // item list, when the caller has one.
+  outlookAccountIdTakenBy(items) {
+    const resolved = this.withSecrets();
+    return (id) => outlookAccountIdTaken(resolved, this.secrets, id, items || []);
+  }
+  // A new row: labelled "Account <n>", its id derived from that label,
+  // switched on, not signed in; `n` counts up until both the label and its
+  // id are free of any listed or removed account's traces. Returns the id.
+  async addOutlookAccount(items) {
+    const taken = this.outlookAccountIdTakenBy(items);
+    let label = '';
+    let id = '';
+    for (let n = outlookAccountList(this.settings).length + 1; n < 1000 && !id; n += 1) {
+      const candidate = `Account ${n}`;
+      const derived = outlookAccountIdFromLabel(candidate);
+      if (derived && !taken(derived) && !outlookAccountLabelTaken(this.settings, candidate, null)) { label = candidate; id = derived; }
+    }
     if (!id) return null;
     outlookAccountRawList(this.settings, true).push({ accountId: id, label, enabled: true });
     await this.saveSettings();
     this.emitModelChanged();
     return id;
   }
-  // The label, and the id with it while nothing depends on the id. A label
-  // another account holds is refused; an empty one too. `items` is the vault's
-  // item list (the settings tab collects it once per render); without one, a
-  // note carrying the id is not seen and only the other locks apply.
+  // The label, and the id with it while nothing depends on the id: not a
+  // sign-in, a shadow, a feed, a note (outlookAccountIdInUse), and not a
+  // sign-in in flight for it either. A label another account holds is
+  // refused; an empty one too. `items` is the vault's item list (the
+  // settings tab collects it when a control is used); without one, a note
+  // carrying the id is not seen and only the other locks apply.
   async renameOutlookAccount(accountId, label, items) {
     const next = trimmed(label);
     const rec = this.outlookAccountRecord(accountId);
@@ -8495,10 +8560,13 @@ class IcorPlannerPlugin extends Plugin {
     if (outlookAccountLabelTaken(this.settings, next, accountId)) return { ok: false, reason: 'duplicate' };
     let id = accountId;
     if (accountId !== OUTLOOK_DEFAULT_ACCOUNT) {
-      if (!outlookAccountIdInUse(this.withSecrets(), accountId, items || [])) {
+      const pendingSignIn = [...this.outlookPendingMap().values()].some((p) => p && p.accountId === accountId);
+      if (!pendingSignIn && !outlookAccountIdInUse(this.withSecrets(), accountId, items || [])) {
         const derived = outlookAccountIdFromLabel(next);
         if (derived && derived !== accountId) {
-          id = outlookUniqueAccountId(derived, outlookAccountList(this.settings).map((a) => a.accountId).filter((x) => x !== accountId));
+          const taken = this.outlookAccountIdTakenBy(items);
+          id = outlookUniqueAccountId(derived, (x) => x !== accountId && taken(x));
+          if (!id) return { ok: false, reason: 'unlisted' };
           rec.accountId = id;
           delete this.syncStatusByAccount[accountId];
         }
@@ -8542,7 +8610,7 @@ class IcorPlannerPlugin extends Plugin {
     list.splice(at, 1);
     await this.saveSettings();
     this.recomputeCalendarDefs();
-    new Notice(`Planner: removed the Outlook account "${label}" and its sign-in. Its notes stay in the vault and show under "Not in the account list" in the tray.`, 8000);
+    new Notice(`Planner: removed the Outlook account "${label}" and its sign-in and calendar. Its notes stay in the vault and show under "Not in the account list" in the tray.`, 8000);
     return true;
   }
 
@@ -12552,31 +12620,54 @@ class IcorPlannerSettingTab extends PluginSettingTab {
     // The list edited in place (#38, part 4b): with more than one account
     // every row carries its label and its switch; a further row can be
     // removed (two presses, like a calendar). A one-account vault sees none
-    // of this, only the Add row below. The item list is read once, for the
-    // id lock in renameOutlookAccount.
+    // of this, only the Add row below. The vault's items are read when a
+    // control needs them (the id lock), once per render at most, never on
+    // the render itself.
     const focusAccount = (selector) => {
       const el = this.containerEl.querySelector(selector);
-      if (el) el.focus();
+      if (!el) return;
+      el.focus();
+      // A fresh row's name is a placeholder ("Account 2"): typing replaces it.
+      if (typeof el.select === 'function') el.select();
     };
-    const noteItems = accounts.length > 1 ? collectItems(this.plugin.app, this.plugin.paths().root) : [];
-    const accountControls = (row, account) => {
+    let noteItems = null;
+    const collectNotes = () => noteItems || (noteItems = collectItems(this.plugin.app, this.plugin.paths().root));
+    // Each row reads its account's id and label from a holder that a
+    // successful rename updates in place (the id follows the label while
+    // unlocked), so every control on the row targets the current id and the
+    // row's labels follow, with no re-render, so the focus stays in the
+    // field being typed in.
+    const accountControls = (row, held) => {
+      let nameEl = null;
+      let toggleEl = null;
+      held.relabel = () => {
+        if (nameEl) { nameEl.setAttribute('aria-label', `Name of the Microsoft account ${held.label}`); nameEl.setAttribute('data-account-label', held.id); }
+        if (toggleEl) toggleEl.setAttribute('aria-label', `Sync the Microsoft account ${held.label}`);
+        if (held.onRelabel) held.onRelabel();
+      };
       row.addText((t) => {
-        t.setPlaceholder('Name').setValue(account.label);
-        t.inputEl.setAttribute('aria-label', `Name of the Microsoft account ${account.label}`);
-        t.inputEl.setAttribute('data-account-label', account.accountId);
+        nameEl = t.inputEl;
+        t.setPlaceholder('Name').setValue(held.label);
         t.onChange(async (v) => {
-          const res = await this.plugin.renameOutlookAccount(account.accountId, v, noteItems);
-          if (res.ok) { row.setName(`Microsoft account: ${trimmed(v)}`); return; }
-          row.setDesc(res.reason === 'duplicate' ? 'Another account already has this name.' : 'A name is needed.');
+          const res = await this.plugin.renameOutlookAccount(held.id, v, collectNotes());
+          if (!res.ok) { row.setDesc(res.reason === 'duplicate' ? 'Another account already has this name.' : 'A name is needed.'); return; }
+          held.id = res.accountId;
+          held.label = trimmed(v);
+          row.setName(`Microsoft account: ${held.label}`);
+          held.relabel();
+          // The status line again (a refused name wrote over it).
+          renderOutlookStatus();
         });
       });
       row.addToggle((t) => {
-        t.setValue(account.enabled).setTooltip('Sync this account');
-        t.toggleEl.setAttribute('aria-label', `Sync the Microsoft account ${account.label}`);
-        t.onChange(async (v) => { await this.plugin.setOutlookAccountEnabled(account.accountId, v); });
+        toggleEl = t.toggleEl;
+        t.setValue(held.enabled).setTooltip('Sync this account');
+        t.onChange(async (v) => { await this.plugin.setOutlookAccountEnabled(held.id, v); });
       });
+      held.relabel();
     };
-    if (accounts.length > 1) accountControls(acct, accounts[0]);
+    const holders = accounts.map((a) => ({ id: a.accountId, label: a.label, enabled: a.enabled, relabel: null, onRelabel: null }));
+    if (accounts.length > 1) accountControls(acct, holders[0]);
     let signInBtn = null;
     let signOutBtn = null;
     // The further rows refresh with the default row (a typed client id
@@ -12610,24 +12701,25 @@ class IcorPlannerSettingTab extends PluginSettingTab {
     // sign-in through the same app registration, its own token set, its
     // own sign-out; its mail syncs on its own run (part 3).
     for (const account of accounts.slice(1)) {
+      const held = holders[accounts.indexOf(account)];
       const row = new Setting(containerEl).setName(`Microsoft account: ${account.label}`);
       row.descEl.setAttribute('aria-live', 'polite');
-      accountControls(row, account);
+      accountControls(row, held);
       let inBtn = null;
       let outBtn = null;
       row.addButton((b) => {
         inBtn = b;
-        b.onClick(() => this.plugin.outlookSignIn({ accountId: account.accountId, onDone: () => this.display() }));
+        b.onClick(() => this.plugin.outlookSignIn({ accountId: held.id, onDone: () => this.display() }));
       });
       row.addButton((b) => {
         outBtn = b;
         b.setButtonText('Sign out').onClick(async () => {
-          await this.plugin.outlookSignOut(account.accountId);
+          await this.plugin.outlookSignOut(held.id);
           this.display();
         });
       });
       accountRefreshers.push((r) => {
-        const view = outlookAccountView(r, account);
+        const view = outlookAccountView(r, held.id);
         const signed = outlookSignedIn(view);
         row.setDesc(outlookStatusText(view));
         inBtn.setButtonText(signed ? 'Sign in again' : 'Sign in');
@@ -12641,8 +12733,9 @@ class IcorPlannerSettingTab extends PluginSettingTab {
       row.addExtraButton((b) => {
         let armed = false;
         let disarm = null;
-        const rest = () => { armed = false; b.setIcon('trash').setTooltip('Remove this account'); b.extraSettingsEl.setAttribute('aria-label', `Remove the Microsoft account ${account.label}`); };
+        const rest = () => { armed = false; b.setIcon('trash').setTooltip('Remove this account'); b.extraSettingsEl.setAttribute('aria-label', `Remove the Microsoft account ${held.label}`); };
         rest();
+        held.onRelabel = () => { if (!armed) rest(); };
         b.onClick(async () => {
           if (!armed) {
             armed = true;
@@ -12652,7 +12745,7 @@ class IcorPlannerSettingTab extends PluginSettingTab {
             return;
           }
           if (disarm) window.clearTimeout(disarm);
-          await this.plugin.removeOutlookAccount(account.accountId);
+          await this.plugin.removeOutlookAccount(held.id);
           this.display();
           focusAccount('[data-add-account]');
         });
@@ -12667,7 +12760,7 @@ class IcorPlannerSettingTab extends PluginSettingTab {
       .addButton((b) => {
         b.setButtonText('Add').buttonEl.setAttribute('data-add-account', '1');
         b.onClick(async () => {
-          const id = await this.plugin.addOutlookAccount();
+          const id = await this.plugin.addOutlookAccount(collectNotes());
           this.display();
           if (id) focusAccount(`[data-account-label="${id}"]`);
         });
@@ -13163,5 +13256,5 @@ module.exports.__test = {
   // more than one Microsoft account: the tray by account (#38, part 4)
   OUTLOOK_DISABLED_MESSAGE, traySectionKey, traySourceSections, PlannerTrayView, cardAccountLabel, renderCard,
   // more than one Microsoft account: the list edited from settings (#38, part 4b)
-  outlookAccountIdFromLabel, outlookUniqueAccountId, outlookAccountLabelTaken, outlookAccountIdInUse, IcorPlannerSettingTab,
+  outlookAccountIdFromLabel, outlookUniqueAccountId, outlookAccountLabelTaken, outlookAccountIdInUse, outlookAccountIdTaken, IcorPlannerSettingTab,
 };

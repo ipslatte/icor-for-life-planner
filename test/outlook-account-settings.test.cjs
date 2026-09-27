@@ -227,7 +227,7 @@ test('remove signs the account out first (its keys cleared, its suffixed fields 
   });
   // The Notice (main.js binds the class at load, so its text is read here).
   const removal = code().slice(code().indexOf('async removeOutlookAccount('), code().indexOf('  markSyncWrite(fileOrPath) {'));
-  assert.match(removal, /new Notice\(`Planner: removed the Outlook account "\$\{label\}" and its sign-in\. Its notes stay in the vault and show under "Not in the account list" in the tray\.`, 8000\);/);
+  assert.match(removal, /new Notice\(`Planner: removed the Outlook account "\$\{label\}" and its sign-in and calendar\. Its notes stay in the vault and show under "Not in the account list" in the tray\.`, 8000\);/);
   // No vault method was called (the fixture throws on any): the notes stay
   // where they are and show under the tray's unlisted section.
   const items = [item('outlook', 'w1', { source_account: 'work' }), item('outlook', 'd1')];
@@ -374,7 +374,10 @@ function renderTab(settings, over) {
     setupNextBadge() { }, removeNextBadge() { }, openImportHabits() { }, setRoutineActive() { }, setSecretsBackend() { }, setEnvFilePath() { }, moveSecretsFrom() { }, ensureFolders: async () => { }, syncNow() { },
     outlookSignIn() { }, outlookSignOut: async () => { },
     addOutlookAccount: async () => { calls.added += 1; return 'account-2'; },
-    renameOutlookAccount: async (id, label, items) => { calls.renamed.push([id, label, items.length]); return label.trim().toLowerCase() === 'personal' ? { ok: false, reason: 'duplicate' } : label.trim() ? { ok: true, accountId: id } : { ok: false, reason: 'empty' }; },
+    // The stub moves the id the way the real operation does for an unlocked
+    // account (the id follows the label), so a row that kept its render-time
+    // id would be caught here too.
+    renameOutlookAccount: async (id, label, items) => { calls.renamed.push([id, label, items.length]); const next = label.trim(); if (next.toLowerCase() === 'personal') return { ok: false, reason: 'duplicate' }; if (!next) return { ok: false, reason: 'empty' }; return { ok: true, accountId: id === 'default' ? id : (TAB.outlookAccountIdFromLabel(next) || id) }; },
     setOutlookAccountEnabled: async (id, on) => { calls.switched.push([id, on]); return true; },
     removeOutlookAccount: async (id) => { calls.removed.push(id); return true; },
   }, over || {});
@@ -456,14 +459,19 @@ async function twoAccountRows() {
   assert.equal(rows[1].descEl.textContent, 'Another account already has this name.');
   await wName.handlers.change('Client');
   assert.equal(rows[1].nameEl.textContent, 'Microsoft account: Client');
+  assert.equal(wName.el.getAttribute('data-account-label'), 'client', 'the row now targets the moved id');
+  assert.equal(wName.el.getAttribute('aria-label'), 'Name of the Microsoft account Client');
+  assert.equal(wToggle.el.getAttribute('aria-label'), 'Sync the Microsoft account Client');
+  assert.equal(wRemove.el.getAttribute('aria-label'), 'Remove the Microsoft account Client');
   await wName.handlers.change('  ');
   assert.equal(rows[1].descEl.textContent, 'A name is needed.');
   await dName.handlers.change('Home');
-  assert.deepEqual(calls.renamed.map((r) => r[0]), ['work', 'work', 'work', 'default']);
+  assert.deepEqual(calls.renamed.map((r) => r[0]), ['work', 'work', 'client', 'default'], 'the third keystroke carries the id the second one produced');
+  assert.equal(dName.el.getAttribute('data-account-label'), 'default', 'the default\'s id never moves');
   // The switch.
   await wToggle.handlers.change(false);
   await dToggle.handlers.change(false);
-  assert.deepEqual(calls.switched, [['work', false], ['default', false]]);
+  assert.deepEqual(calls.switched, [['client', false], ['default', false]]);
   // Remove: armed on the first press, done on the second, then a re-render.
   await wRemove.handlers.click();
   assert.deepEqual(calls.removed, []);
@@ -471,7 +479,7 @@ async function twoAccountRows() {
   assert.equal(wRemove.el.getAttribute('aria-label'), 'Press again to sign out and remove');
   assert.equal(calls.displayed, 0);
   await wRemove.handlers.click();
-  assert.deepEqual(calls.removed, ['work']);
+  assert.deepEqual(calls.removed, ['client']);
   assert.equal(calls.displayed, 1);
   assert.equal(calls.saved, 0, 'the tab itself saves nothing; the operations do');
   // Add re-renders and hands focus to the new row's name.
@@ -483,6 +491,223 @@ async function twoAccountRows() {
   // vault for other rows too, so a call count would not isolate it).
 }
 
+/* ---- the store, as the auth tests fake it ---- */
+class FakeSecretStorage {
+  constructor() { this.m = new Map(); }
+  setSecret(id, secret) { if (!/^[a-z0-9-]+$/.test(id)) throw new Error(`invalid secret id: ${id}`); this.m.set(id, String(secret)); }
+  getSecret(id) { return this.m.has(id) ? this.m.get(id) : null; }
+  listSecrets() { return [...this.m.keys()]; }
+}
+const json = (status, body) => ({ status, json: body, text: JSON.stringify(body), headers: {} });
+const storeKeys = (storage, id) => [...storage.m.entries()].filter(([k, v]) => k.endsWith(`-${id}`) && v).map(([k]) => k.replace('icor-for-life-planner-', ''));
+const TOKENS = { accessToken: 'at-a1', refreshToken: 'rt-a1', expiresIn: 3600, scope: 'Mail.Read' };
+function live(settings, storage) {
+  const vault = new T.SecretVault(storage);
+  const { p, log } = plugin(settings, { secrets: vault, withSecrets: () => T.withSecrets(p.settings, vault), syncNow: () => { }, _outlookModal: null });
+  Object.defineProperty(p, 'withSecrets', { value: () => T.withSecrets(p.settings, vault) });
+  return { p, log, vault };
+}
+
+/* ---- 9. a removed account's id is not handed to the next one (V1) ---- */
+test('remove then Add gives a fresh id: a shadow, a stamped note, a suffixed field or a store key left under an id keeps it from a new or renamed account', async () => {
+  const storage = new FakeSecretStorage();
+  const { p, vault } = live({ outlookClientId: CLIENT, calendars: [], _shadow: {}, outlookAccounts: [{ accountId: 'default', label: 'Personal' }] }, storage);
+  await withNotice(async () => {
+    const id1 = await p.addOutlookAccount([]);
+    assert.equal(id1, 'account-2');
+    await p.outlookFinishSignIn(TOKENS, { accountId: id1, scopes: 'Mail.Read', record: p.settings.outlookAccounts[1] }, { requestUrl: async () => json(200, { mail: 'mailbox-a' }) });
+    assert.ok(storeKeys(storage, id1).includes('outlook-refresh-token-account-2'));
+    p.settings._shadow[`outlook@${id1}:m-a1`] = { done: true };
+    const notes = [item('outlook', 'm-a1', { source_account: id1 })];
+    assert.equal(await p.removeOutlookAccount(id1), true);
+    assert.deepEqual(storeKeys(storage, id1), [], 'removal blanked its keys');
+    // The shadow alone keeps the id taken.
+    assert.equal(T.outlookAccountIdTaken(p.withSecrets(), vault, id1, []), true);
+    const id2 = await p.addOutlookAccount(notes);
+    assert.equal(id2, 'account-3', 'the removed id is not reused');
+    assert.equal(p.settings.outlookAccounts[1].label, 'Account 3', 'the label and the id agree');
+    assert.equal(T.outlookAccountIdInUse(p.withSecrets(), id2, notes), false, 'not locked at birth');
+    assert.equal(T.outlookSignedIn(T.outlookAccountView(p.withSecrets(), id2)), false, 'not signed in at birth');
+    // Each trace on its own: a stamped note, a suffixed field, a store key.
+    delete p.settings._shadow[`outlook@${id1}:m-a1`];
+    assert.equal(T.outlookAccountIdTaken(p.withSecrets(), vault, id1, []), false, 'nothing left: free again');
+    assert.equal(T.outlookAccountIdTaken(p.withSecrets(), vault, id1, notes), true, 'a stamped note');
+    p.settings.outlookScopes__gone = 'Mail.Read';
+    assert.equal(T.outlookAccountIdTaken(p.withSecrets(), vault, 'gone', []), true, 'a suffixed field');
+    delete p.settings.outlookScopes__gone;
+    storage.setSecret('icor-for-life-planner-outlook-refresh-token-stale', 'rt-s1');
+    assert.equal(T.outlookAccountIdTaken(p.withSecrets(), vault, 'stale', []), true, 'a store key, read from the store itself');
+    assert.equal(T.outlookAccountIdTaken(p.withSecrets(), vault, 'default', []), true);
+    assert.equal(T.outlookAccountIdTaken(p.withSecrets(), vault, id2, []), true, 'listed');
+    assert.equal(T.outlookAccountIdTaken(p.withSecrets(), vault, 'Not An Id', []), true, 'an id outside the rule is never handed out (and never asked of the store)');
+    assert.equal(T.outlookAccountIdTaken(p.withSecrets(), vault, '', []), true);
+    // Rename: a label whose id carries residue takes a suffix, like a listed one.
+    assert.deepEqual(await p.renameOutlookAccount(id2, 'Stale', []), { ok: true, accountId: 'stale-2' });
+    assert.deepEqual(await p.renameOutlookAccount('stale-2', 'Account 2', notes), { ok: true, accountId: 'account-2-2' }, 'the note stamped account-2 keeps that id taken');
+    // Add skips labels whose id is taken and lands label and id together.
+    storage.setSecret('icor-for-life-planner-outlook-refresh-token-account-3', 'rt-x');
+    assert.equal(await p.addOutlookAccount([]), 'account-4');
+  });
+});
+
+/* ---- 10. a sign-in that finishes after a rename or removal stores nothing (V2) ---- */
+test('a sign-in whose account was renamed or removed while it ran stores nothing, makes no feed, and asks for a new sign-in; a sign-in in flight locks the id', async () => {
+  // Renamed during the token exchange (the pending entry is already gone
+  // there, so only the finish-time check can catch it).
+  let storage = new FakeSecretStorage();
+  let { p, vault } = live({ outlookClientId: CLIENT, calendars: [], _shadow: {}, outlookAccounts: [{ accountId: 'default', label: 'Personal' }] }, storage);
+  await withNotice(async () => {
+    const id1 = await p.addOutlookAccount([]);
+    const record = p.settings.outlookAccounts[1];
+    let done = 0;
+    p.outlookRememberPending({ state: 'st-1', verifier: 'v-1', clientId: CLIENT, tenant: 'common', scopes: 'Mail.Read', accountId: id1, record, onDone: () => { done += 1; } });
+    const requestUrl = async (req) => {
+      if (/token/.test(req.url)) {
+        assert.deepEqual(await p.renameOutlookAccount(id1, 'Work', []), { ok: true, accountId: 'work' }, 'the pending entry is gone by the exchange, so the rename moves the id');
+        return json(200, { access_token: 'at-a1', refresh_token: 'rt-a1', expires_in: 3600, scope: 'Mail.Read' });
+      }
+      return json(200, { mail: 'mailbox-a' });
+    };
+    await p.outlookAuthCallback({ code: 'c-1', state: 'st-1' }, { requestUrl });
+    assert.deepEqual(storeKeys(storage, id1), [], 'nothing under the old id');
+    assert.deepEqual(storeKeys(storage, 'work'), [], 'nothing under the new id either: the sign-in was for a record that moved');
+    assert.equal(T.outlookSignedIn(T.outlookAccountView(p.withSecrets(), 'work')), false);
+    assert.deepEqual(p.settings.calendars, [], 'no feed');
+    assert.equal(`outlookScopes__${id1}` in p.settings, false);
+    assert.equal(done, 1, 'onDone still fires, so the tab re-renders');
+    assert.deepEqual(T.outlookSecretAccountIds(p.settings), ['work'], 'no orphan in the Keys section');
+  });
+  // Removed while /me is awaited: the tokens just stored leave again.
+  storage = new FakeSecretStorage();
+  ({ p, vault } = live({ outlookClientId: CLIENT, calendars: [], _shadow: {}, outlookAccounts: [{ accountId: 'default', label: 'Personal' }, { accountId: 'work', label: 'Work' }] }, storage));
+  await withNotice(async () => {
+    const record = p.settings.outlookAccounts[1];
+    let seenAtMe = null;
+    const requestUrl = async () => { seenAtMe = storeKeys(storage, 'work'); await p.removeOutlookAccount('work'); return json(200, { mail: 'mailbox-a' }); };
+    await p.outlookFinishSignIn(TOKENS, { accountId: 'work', scopes: 'Mail.Read', record }, { requestUrl });
+    assert.ok(seenAtMe.includes('outlook-refresh-token-work'), 'the tokens were stored before /me');
+    assert.deepEqual(storeKeys(storage, 'work'), [], 'and left again');
+    assert.equal('outlookScopes__work' in p.settings, false);
+    assert.equal('outlookAccount__work' in p.settings, false);
+    assert.deepEqual(p.settings.calendars, [], 'no feed re-created');
+    assert.deepEqual(T.outlookAccountList(p.settings).map((a) => a.accountId), ['default']);
+  });
+  // A record removed and another added under the same id (nothing was left,
+  // so the id was free): the sign-in was for the old record and is refused.
+  storage = new FakeSecretStorage();
+  ({ p, vault } = live({ outlookClientId: CLIENT, calendars: [], _shadow: {}, outlookAccounts: [{ accountId: 'default', label: 'Personal' }] }, storage));
+  await withNotice(async () => {
+    const id1 = await p.addOutlookAccount([]);
+    const old = p.settings.outlookAccounts[1];
+    await p.removeOutlookAccount(id1);
+    assert.equal(await p.addOutlookAccount([]), id1, 'free again: nothing was ever stored under it');
+    await p.outlookFinishSignIn(TOKENS, { accountId: id1, scopes: 'Mail.Read', record: old }, { requestUrl: async () => json(200, { mail: 'mailbox-a' }) });
+    assert.deepEqual(storeKeys(storage, id1), [], 'a different record under the same id: refused');
+    // The same sign-in for the current record goes through.
+    await p.outlookFinishSignIn(TOKENS, { accountId: id1, scopes: 'Mail.Read', record: p.settings.outlookAccounts[1] }, { requestUrl: async () => json(200, { mail: 'mailbox-a' }) });
+    assert.ok(storeKeys(storage, id1).includes('outlook-refresh-token-account-2'));
+    assert.deepEqual(p.settings.calendars.map((f) => f.id), ['outlook-graph-account-2']);
+  });
+  // A sign-in in flight locks the id: the rename during the browser round
+  // trip moves the label only, and the sign-in lands on the listed row.
+  storage = new FakeSecretStorage();
+  ({ p, vault } = live({ outlookClientId: CLIENT, calendars: [], _shadow: {}, outlookAccounts: [{ accountId: 'default', label: 'Personal' }] }, storage));
+  await withNotice(async () => {
+    const id1 = await p.addOutlookAccount([]);
+    p.outlookRememberPending({ state: 'st-2', verifier: 'v-2', clientId: CLIENT, tenant: 'common', scopes: 'Mail.Read', accountId: id1, record: p.settings.outlookAccounts[1] });
+    assert.deepEqual(await p.renameOutlookAccount(id1, 'Work', []), { ok: true, accountId: id1 }, 'the label moves, the id stays');
+    assert.equal(p.settings.outlookAccounts[1].label, 'Work');
+    const requestUrl = async (req) => (/token/.test(req.url) ? json(200, { access_token: 'at-a1', refresh_token: 'rt-a1', expires_in: 3600, scope: 'Mail.Read' }) : json(200, { mail: 'mailbox-a' }));
+    await p.outlookAuthCallback({ code: 'c-2', state: 'st-2' }, { requestUrl });
+    assert.ok(storeKeys(storage, id1).includes('outlook-refresh-token-account-2'), 'landed on the row the member sees');
+    assert.equal(T.outlookSignedIn(T.outlookAccountView(p.withSecrets(), id1)), true);
+    assert.deepEqual(p.settings.calendars.map((f) => [f.id, f.name]), [['outlook-graph-account-2', 'Outlook calendar (Work)']]);
+    // Signed in now: the id is locked for good, by the token.
+    assert.deepEqual(await p.renameOutlookAccount(id1, 'Client', []), { ok: true, accountId: id1 });
+  });
+  // The sign-in Notice for the refused case, pinned in the source.
+  assert.match(code(), /new Notice\('Planner: the Outlook account was renamed or removed while signing in; sign in again from its row\.', 10000\);/);
+});
+
+/* ---- 11. a rotation after the removal writes nothing (V3) ---- */
+test('a sync run refreshing its token after the account was removed writes nothing under the retired id; the default and a listed account still rotate', async () => {
+  const storage = new FakeSecretStorage();
+  const { p, vault } = live({ outlookClientId: CLIENT, calendars: [], _shadow: {}, outlookAccounts: [{ accountId: 'default', label: 'Personal' }] }, storage);
+  await withNotice(async () => {
+    const id1 = await p.addOutlookAccount([]);
+    await p.outlookFinishSignIn(TOKENS, { accountId: id1, scopes: 'Mail.Read', record: p.settings.outlookAccounts[1] }, { requestUrl: async () => json(200, { mail: 'mailbox-a' }) });
+    const view = T.outlookAccountView(p.withSecrets(), id1); // what a run in flight holds
+    await p.removeOutlookAccount(id1);
+    const tok = await T.ensureAccessToken(view, { requestUrl: async () => json(200, { access_token: 'at-a2', refresh_token: 'rt-a2', expires_in: 3600 }), now: () => Date.now() }, true);
+    assert.equal(tok, 'at-a2', 'the run itself finishes with the token it was given');
+    assert.deepEqual(storeKeys(storage, id1), [], 'nothing written under the retired id');
+    assert.equal(await p.addOutlookAccount([]), 'account-2', 'free: nothing was left, so the next Add may reuse it');
+    assert.equal(T.outlookSignedIn(T.outlookAccountView(p.withSecrets(), 'account-2')), false, 'not signed in at birth');
+  });
+  // The pure rule: a listed account and the default still save.
+  const s = { outlookClientId: CLIENT, outlookAccounts: [{ accountId: 'default' }, { accountId: 'work', label: 'Work' }] };
+  T.saveOutlookTokens({ live: s, vault: null, account: 'work' }, TOKENS, 0);
+  assert.equal(s.outlookRefreshToken__work, 'rt-a1');
+  T.saveOutlookTokens({ live: s, vault: null, account: 'gone' }, TOKENS, 0);
+  assert.equal('outlookRefreshToken__gone' in s, false, 'an unlisted account gets nothing');
+  T.saveOutlookTokens({ live: s, vault: null }, TOKENS, 0);
+  assert.equal(s.outlookRefreshToken, 'rt-a1', 'the default always saves');
+});
+
+/* ---- 12. the row follows its id, keystroke by keystroke (V4 / Flint C1, C2) ---- */
+test('typing three keystrokes into a new row moves the id each time and every control follows: Sign in and Remove target the final id, the labels follow, and a refused name does not wipe the status line for good', async () => {
+  const hadWindow = 'window' in globalThis;
+  if (!hadWindow) globalThis.window = { setTimeout: () => 7, clearTimeout: () => { }, open: () => { } };
+  try {
+    // A real plugin behind the rendered tab: the operations are the real
+    // ones, only the sign-in start, the save and the model are recorded.
+    const s = Object.assign({}, T.DEFAULT_SETTINGS, { outlookClientId: CLIENT, outlookRefreshToken: 'rt-d1', calendars: [], _shadow: {}, outlookAccounts: [{ accountId: 'default', label: 'Personal' }, { accountId: 'account-2', label: 'Account 2', enabled: true }] });
+    const { p } = plugin(s);
+    const signIns = [];
+    const removed = [];
+    const over = {
+      settings: s,
+      withSecrets: () => Object.assign({}, s, { _live: s }),
+      renameOutlookAccount: (...a) => p.renameOutlookAccount(...a),
+      setOutlookAccountEnabled: (...a) => p.setOutlookAccountEnabled(...a),
+      removeOutlookAccount: async (id) => { removed.push(id); return p.removeOutlookAccount(id); },
+      outlookSignIn: (o) => { signIns.push(o.accountId); },
+      outlookPendingMap: () => p.outlookPendingMap(),
+    };
+    const { named, calls } = renderTab(s, over);
+    const row = named('Microsoft account: Account 2')[0];
+    const [name, toggle, signIn, , remove] = row.components;
+    const status = row.descEl.textContent;
+    assert.match(status, /sign in|Sign in|not signed in|client id/i, 'the status line before typing');
+    for (const typed of ['W', 'Wo', 'Wor']) await name.handlers.change(typed);
+    assert.deepEqual(T.outlookAccountList(s).map((a) => [a.accountId, a.label]), [['default', 'Personal'], ['wor', 'Wor']], 'every keystroke was saved, the id following the label');
+    assert.equal(row.nameEl.textContent, 'Microsoft account: Wor');
+    assert.equal(name.el.getAttribute('data-account-label'), 'wor');
+    assert.equal(name.el.getAttribute('aria-label'), 'Name of the Microsoft account Wor');
+    assert.equal(toggle.el.getAttribute('aria-label'), 'Sync the Microsoft account Wor');
+    assert.equal(remove.el.getAttribute('aria-label'), 'Remove the Microsoft account Wor');
+    assert.equal(row.descEl.textContent, status, 'the status line is what it was');
+    // A refused name writes over the status; the next good name brings it back.
+    await name.handlers.change('');
+    assert.equal(row.descEl.textContent, 'A name is needed.');
+    await name.handlers.change('Personal');
+    assert.equal(row.descEl.textContent, 'Another account already has this name.');
+    await name.handlers.change('Work');
+    assert.equal(row.descEl.textContent, status, 'restored');
+    assert.deepEqual(T.outlookAccountList(s).map((a) => a.accountId), ['default', 'work']);
+    // Sign in and Remove target the id the row has now.
+    signIn.handlers.click();
+    assert.deepEqual(signIns, ['work']);
+    await toggle.handlers.change(false);
+    assert.equal(T.outlookAccountById(s, 'work').enabled, false);
+    await remove.handlers.click();
+    await remove.handlers.click();
+    assert.deepEqual(removed, ['work']);
+    assert.deepEqual(T.outlookAccountList(s).map((a) => a.accountId), ['default'], 'removed for real');
+    assert.equal(calls.displayed, 1);
+  } finally { if (!hadWindow) delete globalThis.window; }
+});
+
 /* ---- 8. source scan ---- */
 test('source scan: the list has one door, the removal clears the keys the way sign-out does, the Add row follows the account rows, and no text sends the member to data.json', () => {
   const c = code();
@@ -490,7 +715,6 @@ test('source scan: the list has one door, the removal clears the keys the way si
   assert.equal(readers.length, 1, 'outlookAccountRawList is the one line that touches the key');
   assert.match(readers[0], /return Array\.isArray\(s\.outlookAccounts\) \? s\.outlookAccounts : \(create \? \(s\.outlookAccounts = \[\]\) : \[\]\);/);
   assert.equal((c.match(/outlookAccountRawList\(this\.settings, true\)/g) || []).length, 2, 'the record lookup and Add lay the list down; nothing else does');
-  assert.equal((c.match(/clearOutlookTokens\(\{ live: this\.settings, vault: this\.secrets, account: id \}\);/g) || []).length, 2, 'sign-out and removal clear an account\'s keys the same way');
   assert.match(c, /clearOutlookTokens\(\{ live: this\.settings, vault: this\.secrets, account: id \}\);\n\s*for \(const f of OUTLOOK_ACCOUNT_FIELDS\) delete this\.settings\[outlookAccountField\(id, f\)\];\n\s*this\.outlookClearPending\(id\);\n\s*delete this\.syncStatusByAccount\[id\];\n\s*delete this\.syncStatus\.outlook;\n\s*this\.settings\.calendars = calendarFeeds\(this\.settings\)\.filter/, 'removal: keys, fields, pending, rows, feed, in that order, before the record goes');
   assert.match(c, /if \(!id \|\| id === OUTLOOK_DEFAULT_ACCOUNT\) return false;/, 'the default is refused first');
   const removal = c.slice(c.indexOf('async removeOutlookAccount('), c.indexOf('  markSyncWrite(fileOrPath) {'));
@@ -499,8 +723,20 @@ test('source scan: the list has one door, the removal clears the keys the way si
   const tab = c.slice(c.indexOf('class IcorPlannerSettingTab'));
   assert.ok(tab.indexOf('for (const account of accounts.slice(1))') < tab.indexOf(".setName('Add account')"), 'Add after the rows');
   assert.ok(tab.indexOf(".setName('Add account')") < tab.indexOf("setName('Manage or revoke access')"), 'and before the revoke row');
-  assert.match(tab, /const noteItems = accounts\.length > 1 \? collectItems\(this\.plugin\.app, this\.plugin\.paths\(\)\.root\) : \[\];/);
-  assert.match(tab, /if \(accounts\.length > 1\) accountControls\(acct, accounts\[0\]\);/, 'the default row gains its controls only with more than one account');
+  assert.match(tab, /const collectNotes = \(\) => noteItems \|\| \(noteItems = collectItems\(this\.plugin\.app, this\.plugin\.paths\(\)\.root\)\);/, 'the items are read when a control needs them, once per render at most, never on the render');
+  assert.match(tab, /if \(accounts\.length > 1\) accountControls\(acct, holders\[0\]\);/, 'the default row gains its controls only with more than one account');
+  // Every control on a row reads the holder, never the render-time record.
+  const block = tab.slice(tab.indexOf('const accountControls = (row, held) => {'), tab.indexOf(".setName('Add account')"));
+  assert.doesNotMatch(block, /account\.accountId/, 'no control closes over the render-time id');
+  for (const call of ['renameOutlookAccount(held.id, v, collectNotes())', 'setOutlookAccountEnabled(held.id, v)', 'outlookSignIn({ accountId: held.id,', 'outlookSignOut(held.id)', 'removeOutlookAccount(held.id)', 'outlookAccountView(r, held.id)']) assert.ok(block.includes(call), call);
+  assert.match(block, /held\.id = res\.accountId;\n\s*held\.label = trimmed\(v\);\n\s*row\.setName\(`Microsoft account: \$\{held\.label\}`\);\n\s*held\.relabel\(\);\n(\s*\/\/[^\n]*\n)*\s*renderOutlookStatus\(\);/, 'a good rename moves the holder, relabels the row and restores the status line');
+  assert.match(tab, /if \(typeof el\.select === 'function'\) el\.select\(\);/, 'the focused name is selected so typing replaces it');
+  // The sign-in finish checks the record, twice; the token save writes nothing for an unlisted account.
+  assert.match(c, /if \(!stillListed\(\)\) \{ this\.outlookRefuseFinish\(pending\); return; \}\n\s*const label = outlookAccountById\(this\.settings, id\)\.label;\n\s*saveOutlookTokens\(/, 'checked before anything is stored');
+  assert.match(c, /\} catch \{ \/\* the account line is a nicety; the tokens are what matter \*\/ \}\n(\s*\/\/[^\n]*\n)*\s*if \(!stillListed\(\)\) \{\n\s*clearOutlookTokens\(\{ live: this\.settings, vault: this\.secrets, account: id \}\);/, 'checked again after /me, and the stored tokens leave');
+  assert.match(c, /if \(acct !== OUTLOOK_DEFAULT_ACCOUNT && !outlookAccountList\(live\)\.some\(\(a\) => a\.accountId === acct\)\) return;/, 'saveOutlookTokens writes nothing for a retired id');
+  assert.match(c, /const pendingSignIn = \[\.\.\.this\.outlookPendingMap\(\)\.values\(\)\]\.some\(\(p\) => p && p\.accountId === accountId\);/, 'a sign-in in flight locks the id');
+  assert.equal((c.match(/clearOutlookTokens\(\{ live: this\.settings, vault: this\.secrets, account: id \}\);/g) || []).length, 3, 'sign-out, removal, and the refused finish clear an account\'s keys the same way');
   assert.match(tab, /setTooltip\('Press again to sign out and remove'\)/);
   assert.doesNotMatch(c, /data\.json first/, 'no Notice sends the member to data.json');
   assert.match(c, /add it under Outlook in the plugin's settings first\./);

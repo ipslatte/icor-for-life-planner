@@ -341,7 +341,7 @@ test('source scan: the walkers on secretFieldNames(), the pins the sign-in keeps
   const rows = tab.slice(tab.indexOf('for (const account of accounts.slice(1))'), tab.indexOf("setName('Manage or revoke access')"));
   assert.ok(rows.length > 0);
   assert.match(rows, /new Setting\(containerEl\)\.setName\(`Microsoft account: \$\{account\.label\}`\)/);
-  assert.match(rows, /accountRefreshers\.push\(\(r\) => \{\n\s*const view = outlookAccountView\(r, account\);/);
+  assert.match(rows, /accountRefreshers\.push\(\(r\) => \{\n\s*const view = outlookAccountView\(r, held\.id\);/, 'the row reads its current id (part 4b: a rename may move it)');
   assert.match(tab, /if \(signOutBtn\) signOutBtn\.setDisabled\(!signed\);\n\s*for \(const refresh of accountRefreshers\) refresh\(r\);/, 'the default row\'s refresh drives the further rows');
   assert.doesNotMatch(rows, /createEl\('h[1-6]'|\.style\.|style=|setHeading|withSecrets\(\)/, 'no heading tag, no inline style, no second read of the store');
   assert.ok([...rows].every((ch) => ch.charCodeAt(0) < 128), 'plain ASCII, so no dash of either length');
