@@ -566,6 +566,7 @@ test('a card names its mailbox when more than one account is listed: a chip and 
   const view = { index: null, expanded: new Set() };
   const meta = (card) => card.children[1].children.find((c) => c instanceof FakeEl && c.hasClass('iplan-card-meta'));
   const chips = (card) => meta(card).children.filter((c) => c instanceof FakeEl && c.hasClass('iplan-chip')).map((c) => [c.className, c.textContent]);
+  const accountChip = (card) => meta(card).children.find((c) => c instanceof FakeEl && c.hasClass('iplan-account-chip'));
   const markLabel = (card) => meta(card).children[0].getAttribute('aria-label');
   const render = (settings, it, mode) => withDom(() => T.renderCard(plugin(settings), it, mode, view));
   const d = item('outlook', 'd-1', { priority: 1 });
@@ -592,6 +593,13 @@ test('a card names its mailbox when more than one account is listed: a chip and 
     const wc = render(TWO_ACCOUNTS, w, mode);
     assert.equal(markLabel(wc), 'Outlook · Work');
     assert.deepEqual(chips(wc), [['iplan-chip iplan-account-chip', 'WORK']]);
+    // A long label is cut short by the stylesheet, so the chip's title carries
+    // the whole label as typed (not uppercased).
+    assert.equal(accountChip(wc).title, 'Work');
+    const long = with2(null, [{ accountId: 'default', label: 'Personal' }, { accountId: 'work', label: 'A very long mailbox label indeed' }]);
+    assert.equal(accountChip(render(long, w, mode)).title, 'A very long mailbox label indeed');
+    assert.equal(accountChip(render(TWO_ACCOUNTS, bad, mode)).title, 'Not An Id');
+    assert.equal(accountChip(render(ONE_ACCOUNT, w, mode)), undefined);
     assert.deepEqual(chips(render(TWO_ACCOUNTS, gone, mode)), [['iplan-chip iplan-account-chip', 'GONE']]);
     assert.deepEqual(chips(render(TWO_ACCOUNTS, bad, mode)), [['iplan-chip iplan-account-chip', 'NOT AN ID']], 'an invalid stamp shows itself, not the first mailbox');
     assert.deepEqual(chips(render(TWO_ACCOUNTS, t, mode)), [], 'Todoist cards untouched');
@@ -617,6 +625,12 @@ test('a card names its mailbox when more than one account is listed: a chip and 
   const agenda = main.slice(main.indexOf('  renderAgenda(el, items, today) {'), main.indexOf('  renderComposer(el) {'));
   assert.match(agenda, /renderCard\(this\.plugin, entry\.it, 'tray', this\)/, 'the agenda draws the same card');
   assert.match(main.slice(main.indexOf('function cardAccountLabel('), main.indexOf('function sourceMarkEl(')), /if \(!item \|\| !sourceHasAccounts\(item\.source\)\) return null;/);
+  assert.match(card, /chip\.className = 'iplan-chip iplan-account-chip';\n\s*chip\.textContent = accountLabel\.toUpperCase\(\);\n\s*chip\.title = accountLabel;/, 'the title rides the chip');
+  // The stylesheet cuts a long label with an ellipsis instead of widening the card.
+  const css = fs.readFileSync(require('node:path').join(require('node:path').dirname(T.__mainPath), 'styles.css'), 'utf8');
+  const rule = css.match(/\.iplan-chip\.iplan-account-chip \{([^}]*)\}/);
+  assert.ok(rule, 'a rule for the account chip');
+  for (const decl of ['max-width: 14ch', 'overflow: hidden', 'text-overflow: ellipsis', 'min-width: 0']) assert.ok(rule[1].includes(decl), decl);
 });
 
 /* ---- 7. source scan: the loop reads the part, and nothing else moved ---- */

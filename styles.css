@@ -376,6 +376,9 @@ body.iplan-dragging .iplan-lane-empty { visibility: hidden; }
 }
 .iplan-chip.iplan-prio-1 { color: var(--iplan-overdue); border-color: color-mix(in srgb, var(--iplan-overdue) 55%, transparent); }
 .iplan-chip.iplan-goal-chip { color: var(--iplan-goal); border-color: color-mix(in srgb, var(--iplan-goal) 55%, transparent); }
+/* The mailbox chip carries a member-typed label; a long one is cut with an
+   ellipsis instead of pushing the card wide (the full label is the title). */
+.iplan-chip.iplan-account-chip { max-width: 14ch; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 
 /* ----------------------------------------------------------- events ---- */
 .iplan-event {

@@ -9548,6 +9548,7 @@ function renderCard(plugin, item, mode, view) {
     const chip = document.createElement('span');
     chip.className = 'iplan-chip iplan-account-chip';
     chip.textContent = accountLabel.toUpperCase();
+    chip.title = accountLabel; // the whole label when the chip is cut short (styles.css)
     meta.appendChild(chip);
   }
   for (const c of cardChips(item, today, ghost)) {
@@ -10916,11 +10917,11 @@ const TRAY_COPY = {
   // A section for notes whose account stamp names no listed account (#38,
   // part 4). Not "Not connected": the account is missing from the list, not
   // from the device, and no button can add an invalid id back. The hint
-  // says "source account stamp", not the field name: the stamp's field name
-  // appears in exactly two lines of this file, its reader and its writer,
-  // and two tests count them.
+  // says "source account property" (Obsidian's word), not the field name:
+  // the stamp's field name appears in exactly two lines of this file, its
+  // reader and its writer, and two tests count them.
   unlisted: 'Not in the account list.',
-  unlistedHint: 'Add the account back in settings, or correct the source account stamp in these notes.',
+  unlistedHint: 'Add the account back in settings, or correct the source account property in these notes.',
   empty: 'Nothing unscheduled.',
   manualEmpty: 'Nothing added yet.',
   errorFallback: 'Unavailable.',
