@@ -175,7 +175,7 @@ test('the normaliser carries accountId for a graph feed that has one and for not
 test('sign-in and sign-out of a further account: its feed is added under its own id on sign-in, its events leave the board on sign-out, the default\'s feed untouched', async () => {
   const s = settingsFor(THREE, { calendars: [GRAPH_FEED], outlookRefreshToken__work: '', outlookAccessToken__work: '' });
   const p = Object.create(PluginClass.prototype);
-  Object.assign(p, { settings: s, secrets: null, syncStatus: {}, saved: 0, recomputed: 0, synced: 0, _outlookModal: null });
+  Object.assign(p, { settings: s, secrets: null, syncStatus: {}, syncStatusByAccount: {}, saved: 0, recomputed: 0, synced: 0, _outlookModal: null });
   p.saveSettings = async () => { p.saved += 1; };
   p.recomputeCalendarDefs = () => { p.recomputed += 1; };
   p.syncNow = () => { p.synced += 1; };

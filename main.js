@@ -7796,6 +7796,12 @@ class IcorPlannerPlugin extends Plugin {
         if (sourceHasAccounts(source)) result.account = account ? account.accountId : OUTLOOK_DEFAULT_ACCOUNT;
         if (result.ok) await this.upsertSource(source, result);
       }
+      // The per-account rows follow the list: an account removed since the
+      // last sync leaves no row behind, and a list back to one account
+      // leaves none at all, so a re-added or re-enabled account never reads
+      // a row from before.
+      if (accounts.length < 2) this.syncStatusByAccount = {};
+      else for (const id of Object.keys(this.syncStatusByAccount)) if (!accounts.some((a) => a.accountId === id)) delete this.syncStatusByAccount[id];
       // A sync the user pressed for, with a source misconfigured: say what
       // went wrong and what to do about it, once, here, not only in the tray.
       if (manual) {
@@ -8324,6 +8330,7 @@ class IcorPlannerPlugin extends Plugin {
     writeSecret(this.settings, this.secrets, 'outlookAccount', account || 'Microsoft account');
     ensureGraphCalendarFeed(this.settings);
     delete this.syncStatus.outlook;
+    delete this.syncStatusByAccount[OUTLOOK_DEFAULT_ACCOUNT];
     await this.saveSettings();
     this.outlookCloseModalFor(pending);
     new Notice(`Planner: signed in to Outlook${account ? ` as ${account}` : ''}.`);
@@ -8348,6 +8355,7 @@ class IcorPlannerPlugin extends Plugin {
     writeSecret(this.settings, this.secrets, outlookAccountField(id, 'outlookAccount'), account || 'Microsoft account');
     ensureGraphCalendarFeed(this.settings, id, label);
     delete this.syncStatus.outlook;
+    delete this.syncStatusByAccount[id];
     await this.saveSettings();
     this.outlookCloseModalFor(pending);
     new Notice(`Planner: signed in to Outlook (${label})${account ? ` as ${account}` : ''}.`);
@@ -8375,6 +8383,7 @@ class IcorPlannerPlugin extends Plugin {
     this.settings.outlookScopes = '';
     this.outlookClearPending(OUTLOOK_DEFAULT_ACCOUNT);
     delete this.syncStatus.outlook;
+    delete this.syncStatusByAccount[OUTLOOK_DEFAULT_ACCOUNT];
     await this.saveSettings();
     this.recomputeCalendarDefs();
     new Notice('Planner: signed out of Outlook. The token is gone from this vault; to revoke the app on Microsoft\'s side too, use the link in settings.', 8000);
@@ -8386,6 +8395,9 @@ class IcorPlannerPlugin extends Plugin {
     // Blank by now in every mode; the suffixed fields leave data.json.
     for (const f of OUTLOOK_ACCOUNT_FIELDS) delete this.settings[outlookAccountField(id, f)];
     this.outlookClearPending(id);
+    // Its own tray row goes with its sign-in; the folded row is left as it
+    // was here (it was before this part too), the next sync rewrites both.
+    delete this.syncStatusByAccount[id];
     await this.saveSettings();
     // Its calendar feed stays and says it wants a sign-in, as the default's
     // does; its events leave the board now rather than at the next sync.
@@ -9371,6 +9383,18 @@ function markInkPlugin(el, pluginId) {
   if (el && el.dataset && pluginId) el.dataset.inkPlugin = pluginId;
 }
 
+// The account a card should name (#38, part 4), or null: only for the source
+// with accounts and only when more than one is listed, so a one-account card
+// is untouched. The same resolver as the sync and the tray (itemAccountId,
+// then outlookAccountById): an unstamped note is the default's, a stamp
+// nothing lists is named by its id and never by the first mailbox's label.
+function cardAccountLabel(settings, item) {
+  if (!item || !sourceHasAccounts(item.source)) return null;
+  const s = settings || {};
+  if (outlookAccountList(s).length < 2) return null;
+  return outlookAccountById(s, itemAccountId(item)).label;
+}
+
 function sourceMarkEl(source) {
   const meta = SOURCES[source] || SOURCES.todoist;
   const span = document.createElement('span');
@@ -9513,7 +9537,19 @@ function renderCard(plugin, item, mode, view) {
   titleEl.textContent = item.title;
   const meta = document.createElement('div');
   meta.className = 'iplan-card-meta';
-  meta.appendChild(sourceMarkEl(item.source));
+  const mark = sourceMarkEl(item.source);
+  meta.appendChild(mark);
+  // Which mailbox, when more than one is listed (#38, part 4): the mark
+  // speaks it and a chip shows it, on the board, the tray and the agenda
+  // alike (one card renderer). With one account nothing is added.
+  const accountLabel = cardAccountLabel(plugin.settings, item);
+  if (accountLabel) {
+    mark.setAttribute('aria-label', `${(SOURCES[item.source] || {}).label || item.source} · ${accountLabel}`);
+    const chip = document.createElement('span');
+    chip.className = 'iplan-chip iplan-account-chip';
+    chip.textContent = accountLabel.toUpperCase();
+    meta.appendChild(chip);
+  }
   for (const c of cardChips(item, today, ghost)) {
     const chip = document.createElement('span');
     chip.className = c.cls;
@@ -9799,7 +9835,8 @@ function showCardMenu(plugin, item, view, pos) {
       .setIcon('inbox').onClick(() => plugin.unassignItem(item.path)));
   }
   if (item.url) {
-    menu.addItem((mi) => mi.setTitle(`Open in ${(SOURCES[item.source] || {}).label || item.source}`)
+    const accountLabel = cardAccountLabel(plugin.settings, item);
+    menu.addItem((mi) => mi.setTitle(`Open in ${(SOURCES[item.source] || {}).label || item.source}${accountLabel ? ` (${accountLabel})` : ''}`)
       .setIcon('external-link').onClick(() => window.open(item.url, '_external')));
   }
   menu.addItem((mi) => mi.setTitle('Open note')
@@ -10876,6 +10913,14 @@ const TRAY_COPY = {
   unconfiguredDevice: () => 'Not connected on this device.',
   connectDeviceAction: 'Connect this device',
   unsynced: 'Waiting for the first sync.',
+  // A section for notes whose account stamp names no listed account (#38,
+  // part 4). Not "Not connected": the account is missing from the list, not
+  // from the device, and no button can add an invalid id back. The hint
+  // says "source account stamp", not the field name: the stamp's field name
+  // appears in exactly two lines of this file, its reader and its writer,
+  // and two tests count them.
+  unlisted: 'Not in the account list.',
+  unlistedHint: 'Add the account back in settings, or correct the source account stamp in these notes.',
   empty: 'Nothing unscheduled.',
   manualEmpty: 'Nothing added yet.',
   errorFallback: 'Unavailable.',
@@ -10985,6 +11030,7 @@ function traySourceSections(settings, source, items, statusByAccount) {
     key: traySectionKey(source, a.accountId),
     label: isListed ? `${meta.label} · ${a.label}` : `${meta.label} · ${a.accountId} (not listed)`,
     account: a,
+    unlisted: !isListed,
     configured: isListed && sourceConfigured(outlookAccountView(settings, a), source),
     status: !isListed ? undefined
       : a.enabled ? byAccount[a.accountId]
@@ -11623,7 +11669,12 @@ class PlannerTrayView extends ItemView {
         const total = key === MANUAL_SOURCE
           ? items.filter((i) => i.source === MANUAL_SOURCE).length
           : undefined;
-        const state = trayEmptyState(key, configured, st, list.length, total, resolved.secretsInStore === true);
+        // An unlisted account's section says what it is, in place of the
+        // connection state (no sign-in can exist for it, and a Connect
+        // button would point at a list that may not accept the id).
+        const state = part.unlisted
+          ? { kind: 'error', text: TRAY_COPY.unlisted, hint: TRAY_COPY.unlistedHint, docUrl: null }
+          : trayEmptyState(key, configured, st, list.length, total, resolved.secretsInStore === true);
         if (state && (state.kind === 'unconfigured' || state.kind === 'unconfigured-device')) {
           const note = body.createDiv({ cls: 'iplan-tray-note is-unconfigured' });
           note.createSpan({ text: state.text });
@@ -12904,5 +12955,5 @@ module.exports.__test = {
   // more than one Microsoft account: the calendar feed per account (#38, part 3)
   graphFeedId, graphFeedAccountId, outlookFeedView, outlookFeedReady,
   // more than one Microsoft account: the tray by account (#38, part 4)
-  OUTLOOK_DISABLED_MESSAGE, traySectionKey, traySourceSections, PlannerTrayView,
+  OUTLOOK_DISABLED_MESSAGE, traySectionKey, traySourceSections, PlannerTrayView, cardAccountLabel, renderCard,
 };

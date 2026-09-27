@@ -69,7 +69,7 @@ const twoSignedIn = () => Object.assign({}, T.DEFAULT_SETTINGS, {
 // The plugin without Obsidian: the hooks the sign-in methods reach for.
 function headless(settings, vault) {
   const p = Object.create(PluginClass.prototype);
-  Object.assign(p, { settings, secrets: vault, syncStatus: {}, saved: [], recomputed: 0, synced: 0 });
+  Object.assign(p, { settings, secrets: vault, syncStatus: {}, syncStatusByAccount: {}, saved: [], recomputed: 0, synced: 0 });
   p.saveSettings = async () => { p.saved.push(JSON.stringify(p.settings)); };
   p.recomputeCalendarDefs = () => { p.recomputed += 1; };
   p.syncNow = () => { p.synced += 1; };
