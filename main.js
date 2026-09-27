@@ -2552,13 +2552,115 @@ function outlookAccountView(settings, account) {
   const raw = account && typeof account === 'object' ? account.accountId : account;
   const id = raw == null || raw === '' ? OUTLOOK_DEFAULT_ACCOUNT : String(raw);
   if (id === OUTLOOK_DEFAULT_ACCOUNT) return s;
+  // One view per account per resolved copy (#38, part 3): a token rotated
+  // inside one call (ensureAccessToken, through the sink) is what the next
+  // call on the same copy must read, so the copy keeps its views. Only a
+  // copy from withSecrets remembers (it carries `_live`); the live settings
+  // never do, since a sign-in or a sign-out rewrites them.
+  const views = s._live ? outlookAccountViews(s) : null;
+  if (views && views.has(id)) return views.get(id);
   const valid = !!outlookAccountId(id);
   const view = Object.assign({}, s);
   for (const f of OUTLOOK_ACCOUNT_FIELDS) view[f] = valid ? trimmed(s[outlookAccountField(id, f)]) : '';
   Object.defineProperty(view, '_live', { value: s._live || s, enumerable: false });
   Object.defineProperty(view, '_vault', { value: s._vault || null, enumerable: false });
   Object.defineProperty(view, '_account', { value: id, enumerable: false });
+  if (views) views.set(id, view);
   return view;
+}
+function outlookAccountViews(s) {
+  if (!s._accountViews) Object.defineProperty(s, '_accountViews', { value: new Map(), enumerable: false });
+  return s._accountViews;
+}
+
+/* ---- more than one Microsoft account: the sync (#38, part 3) ------------
+ * One sync run per enabled account, on that account's view of the settings
+ * (outlookExtraRuns). A further account's notes carry a `source_account`
+ * stamp; the default's carry none. What a run may touch is decided by that
+ * stamp and by nothing else: a run of account B never reconciles, probes,
+ * unflags or trashes a note stamped for A or a note with no stamp; a run
+ * that cannot name its account reconciles nothing; an account switched off
+ * contributes no run, so its notes are left exactly as they are. The flag
+ * write and the gone probe resolve the mailbox from the NOTE
+ * (outlookItemAccount), never from the run, so the call sites in the sync
+ * core keep their shape.
+ *
+ * Shadow keys: the default and every other source keep `source:id`, so
+ * every shadow already in data.json keeps working; a further account's
+ * shadows live under `source@account:id`. The separator is `@`, not the
+ * `:` the issue text shows, because pruneShadows selects a run's shadows by
+ * the `source:` prefix: under `outlook:work:id` the default's prune would
+ * read `work:id` as an id it does not know and drop account B's done
+ * shadows on every default sync. A Graph message id carries no `@`.
+ */
+// Only the Outlook source has accounts, asked by name from the registry so
+// no other source ever reads a stamp: a `source_account` typed onto a
+// Todoist note changes nothing about Todoist.
+function sourceHasAccounts(source) { return source === CONNECTORS.outlook.id; }
+// The account a note's shadow is keyed under: its stamp for the one source
+// with accounts, the default for every other source whatever the stamp says.
+function itemShadowAccount(item) {
+  return item && sourceHasAccounts(item.source) ? itemAccountId(item) : OUTLOOK_DEFAULT_ACCOUNT;
+}
+function shadowKey(source, accountId, id) {
+  const a = accountId == null || accountId === '' ? OUTLOOK_DEFAULT_ACCOUNT : String(accountId);
+  return a === OUTLOOK_DEFAULT_ACCOUNT ? `${source}:${id}` : `${source}@${a}:${id}`;
+}
+function shadowPrefix(source, accountId) {
+  const a = accountId == null || accountId === '' ? OUTLOOK_DEFAULT_ACCOUNT : String(accountId);
+  return a === OUTLOOK_DEFAULT_ACCOUNT ? `${source}:` : `${source}@${a}:`;
+}
+// The runs beyond the first: one per further ENABLED account, each on its
+// own view. The default is the run syncNow already makes from the registry
+// and is not here. An account switched off contributes no run and is
+// therefore never fetched and never reconciled.
+function outlookExtraRuns(settings) {
+  const s = settings || {};
+  const runs = [];
+  for (const a of outlookAccountList(s)) {
+    if (a.accountId === OUTLOOK_DEFAULT_ACCOUNT || !a.enabled) continue;
+    runs.push({ source: CONNECTORS.outlook.id, account: a, view: outlookAccountView(s, a) });
+  }
+  return runs;
+}
+// Two runs of one source folded into the one status row the tray and the
+// board read. A failed run leads and is what gets reported; the counts add
+// up; the source is complete only when every run was; the first warning
+// raised is kept. An account switched off is not a failure and never hides
+// a live one. Never called with one account, so that row is what it was.
+function mergeSyncStatus(prior, next) {
+  if (!prior) return next;
+  const failed = (st) => !st.ok && st.reason !== 'disabled';
+  const lead = failed(prior) ? prior : failed(next) ? next : prior.ok ? prior : next.ok ? next : prior;
+  const other = lead === prior ? next : prior;
+  return Object.assign({}, lead, {
+    count: (Number(prior.count) || 0) + (Number(next.count) || 0),
+    at: next.at,
+    complete: prior.complete !== false && next.complete !== false,
+    warning: lead.warning != null ? lead.warning : (other.warning != null ? other.warning : null),
+  });
+}
+// The mailbox a NOTE names, as the account record and the flat shape the
+// connector reads. A stamp nothing lists resolves to a disabled account
+// (outlookAccountById), and the connector makes no call for one.
+function outlookItemAccount(settings, item) {
+  const s = settings || {};
+  const account = outlookAccountById(s, itemAccountId(item));
+  return { account, view: outlookAccountView(s, account) };
+}
+// The further accounts signed in without the write permission: what
+// "Complete on source" names, since the toggle starts the default's sign-in
+// only and one sign-in is in flight at a time.
+function outlookAccountsNeedingWrite(settings) {
+  const s = settings || {};
+  return outlookAccountList(s).slice(1).filter((a) => {
+    const view = outlookAccountView(s, a);
+    return outlookSignedIn(view) && !outlookHasWriteScope(view);
+  });
+}
+function outlookWriteConsentNotice(accounts) {
+  const one = accounts.length === 1;
+  return `Planner: ${accounts.map((a) => a.label).join(', ')} ${one ? 'needs' : 'need'} the Mail.ReadWrite permission too. Use "Sign in again" on ${one ? 'its row' : 'each row'} under Outlook, one at a time.`;
 }
 
 /* ---- the stored sign-in ---- */
@@ -2735,6 +2837,10 @@ function outlookItemFromMessage(m) {
 }
 async function outlookFetchOpen(settings, deps) {
   const s = settings || {};
+  // An account switched off in the list is not fetched: a degraded result,
+  // so the upsert never runs and none of its notes is reconciled. The view
+  // names its account; the flat settings are the default.
+  if (!outlookAccountById(s, s._account).enabled) return degraded('outlook', 'disabled', 'Switched off in the account list.');
   if (!trimmed(s.outlookClientId)) return degraded('outlook', 'no-token', 'Outlook is not connected (no client id).');
   if (!outlookSignedIn(s)) return degraded('outlook', 'no-token', 'Outlook is not signed in.');
   try {
@@ -2769,7 +2875,12 @@ async function outlookFetchOpen(settings, deps) {
 // Refused here, before any call, when the sign-in never granted the write
 // permission; the toggle's own hint says how to grant it.
 async function outlookSetClosed(settings, item, closed, deps) {
-  const s = settings || {};
+  // The mailbox is the one the NOTE names (#38, part 3): a further
+  // account's note is written through that account's view, and a note
+  // whose stamp names nothing listed, or an account switched off, is
+  // refused before any call.
+  const { account, view: s } = outlookItemAccount(settings, item);
+  if (!account.enabled) throw new Error(`Outlook (${account.label}) is switched off in the account list, or not listed`);
   if (!outlookSignedIn(s)) throw new Error('Outlook is not signed in');
   if (!outlookHasWriteScope(s)) throw new Error('Outlook has not granted the Mail.ReadWrite permission yet: sign in again under Outlook in the settings');
   await graphRequest(s, deps, {
@@ -2785,8 +2896,10 @@ async function outlookSetClosed(settings, item, closed, deps) {
 // that is still there but no longer flagged is not deleted, it is completed,
 // and reconcile handles that as it always has.
 async function outlookProbeGone(settings, item, deps) {
-  const s = settings || {};
-  if (!outlookSignedIn(s)) return null;
+  // Asked of the mailbox the note names; no evidence for an account
+  // switched off, unlisted or not signed in, so nothing is trashed on it.
+  const { account, view: s } = outlookItemAccount(settings, item);
+  if (!account.enabled || !outlookSignedIn(s)) return null;
   try {
     await graphRequest(s, deps, {
       url: `${GRAPH_BASE}/me/messages/${encodeURIComponent(String(item.id))}?$select=id`,
@@ -5089,10 +5202,14 @@ function ghostItemsFor(items) {
 // pruned by two rules instead: no note carries the id any more, or the done
 // shadow is older than `maxDoneAgeMs`. Returns the keys to drop.
 const DONE_SHADOW_MAX_AGE_MS = 90 * 86400000;
-function pruneShadows(shadowMap, source, existingIds, openIds, nowMs, maxDoneAgeMs) {
+function pruneShadows(shadowMap, source, existingIds, openIds, nowMs, maxDoneAgeMs, accountId) {
   const maxAge = Number.isFinite(maxDoneAgeMs) ? maxDoneAgeMs : DONE_SHADOW_MAX_AGE_MS;
   const drop = [];
-  const prefix = `${source}:`;
+  // Scoped to the account whose ids were passed in (#38, part 3): a run
+  // that fetched one mailbox holds that mailbox's ids only, so it must not
+  // read another account's shadows as orphaned. Absent is the default, and
+  // the default prefix never matches another account's key.
+  const prefix = shadowPrefix(source, accountId);
   for (const key of Object.keys(shadowMap || {})) {
     if (!key.startsWith(prefix)) continue;
     const id = key.slice(prefix.length);
@@ -7556,14 +7673,28 @@ class IcorPlannerPlugin extends Plugin {
       // Every task connector starts at once, in registry order; results are
       // awaited and applied in that same order.
       const runs = SYNCED_SOURCES.map((k) => [k, CONNECTORS[k].fetchOpen(s)]);
-      for (const [source, promise] of runs) {
+      // One more run per further enabled Microsoft account (#38, part 3),
+      // on that account's view of the settings; the line above is every
+      // source's first account and is unchanged, and with one account
+      // nothing is appended. Every run of that source names its account on
+      // its own result, so the upsert knows whose notes it may touch; a
+      // run of any other source names none.
+      for (const r of outlookExtraRuns(s)) runs.push([r.source, CONNECTORS[r.source].fetchOpen(r.view), r.account]);
+      const accounts = outlookAccountList(s);
+      const started = new Set();
+      for (const [source, promise, account] of runs) {
         const result = await promise;
-        this.syncStatus[source] = {
-          ok: result.ok, reason: result.reason || null, message: result.message || null,
+        // With more than one account listed, a message says whose it is.
+        const label = sourceHasAccounts(source) && accounts.length > 1 ? `${(account || accounts[0]).label}: ` : '';
+        const next = {
+          ok: result.ok, reason: result.reason || null, message: result.message ? `${label}${result.message}` : null,
           hint: result.hint || null, docUrl: result.docUrl || null,
           warning: result.warning || null, complete: result.complete !== false,
           count: result.items.length, at: new Date().toISOString(),
         };
+        this.syncStatus[source] = started.has(source) ? mergeSyncStatus(this.syncStatus[source], next) : next;
+        started.add(source);
+        if (sourceHasAccounts(source)) result.account = account ? account.accountId : OUTLOOK_DEFAULT_ACCOUNT;
         if (result.ok) await this.upsertSource(source, result);
       }
       // A sync the user pressed for, with a source misconfigured: say what
@@ -7625,12 +7756,25 @@ class IcorPlannerPlugin extends Plugin {
     // The mailbox generation these ids belong to (IMAP only). Same contract
     // as `scope`: it rides on the result and is stored beside each shadow.
     const uidValidity = (result && result.uidValidity) || null;
+    // Which mailbox this run fetched (#38, part 3), riding on the result the
+    // way `scope` does: syncNow names it on every run of the one source with
+    // accounts and on no other. For that source a run that carries no name
+    // upserts as the default's and reconciles nothing (accountMissing):
+    // "every Outlook note is mine" is the reading that marks account B's
+    // notes done, and nothing here will guess.
+    const hasAccounts = sourceHasAccounts(source);
+    const accountId = hasAccounts && result && result.account ? String(result.account) : null;
+    const accountMissing = hasAccounts && !accountId;
+    // The notes this run owns: for the source with accounts, exactly the
+    // notes stamped for its account (no stamp is the default's); for every
+    // other source, all of its notes, whatever a stray stamp says.
+    const ownsNote = (it) => !hasAccounts || itemAccountId(it) === (accountId || OUTLOOK_DEFAULT_ACCOUNT);
     const folder = this.paths().sourceFolder(source);
     const s = this.withSecrets(); // shallow: s._shadow is the live map
     const allItems = collectItems(this.app, this.paths().root);
     const existing = new Map(); // external id -> item
     for (const it of allItems) {
-      if (it.source === source) existing.set(it.id, it);
+      if (it.source === source && ownsNote(it)) existing.set(it.id, it);
     }
     const index = buildItemIndex(allItems);
     // A renumbered mailbox first: the notes follow their mail onto the new
@@ -7640,8 +7784,8 @@ class IcorPlannerPlugin extends Plugin {
     const remapped = remapByMessageId(source, items, existing, s._shadow);
     for (const r of remapped) {
       if (!r.prior || !r.prior.file) continue;
-      const oldKey = `${source}:${r.from}`;
-      const newKey = `${source}:${r.to}`;
+      const oldKey = shadowKey(source, accountId, r.from);
+      const newKey = shadowKey(source, accountId, r.to);
       // `external_id` is the identity the plugin reads; the id in the
       // filename is display, and renaming a note would churn Sync, links and
       // the cache for no gain (Flint, 2026-09-17, Q3).
@@ -7664,15 +7808,18 @@ class IcorPlannerPlugin extends Plugin {
       openIds.add(t.id);
       const prior = existing.get(t.id);
       if (!prior) {
-        await this.createItemFile(folder, source, t);
-        const fresh = s._shadow[`${source}:${t.id}`];
+        // The default takes the legacy call, which stays as it is; a further
+        // account's note is also stamped with the mailbox it came from.
+        if (accountId && accountId !== OUTLOOK_DEFAULT_ACCOUNT) await this.createItemFile(folder, source, t, accountId);
+        else await this.createItemFile(folder, source, t);
+        const fresh = s._shadow[shadowKey(source, accountId, t.id)];
         if (fresh) {
           if (uidValidity) fresh.uidvalidity = uidValidity;
           if (t.messageId) fresh.messageId = t.messageId;
         }
         continue;
       }
-      const key = `${source}:${t.id}`;
+      const key = shadowKey(source, accountId, t.id);
       const shadow = s._shadow[key] || null;
       const body = await this.readBody(prior.file);
       const sourceVals = { title: t.title, due: t.due || null, priority: t.priority, description: (t.description || '').trim() };
@@ -7738,7 +7885,7 @@ class IcorPlannerPlugin extends Plugin {
         if (!openIds.has(child.id) || !child.doneLocal || !child.file) continue;
         await this.app.fileManager.processFrontMatter(child.file, (fm) => { fm.done_local = false; });
         this.markSyncWrite(child.file);
-        const ck = `${source}:${child.id}`;
+        const ck = shadowKey(source, accountId, child.id);
         if (s._shadow[ck]) s._shadow[ck].done = false;
       }
     }
@@ -7762,9 +7909,15 @@ class IcorPlannerPlugin extends Plugin {
     //
     // The upserts above ran either way, so the board stays live while a source
     // is over its ceiling; only the writes that say "done" stand down.
+    //
+    // A source with more than one account adds a fourth (#38, part 3): the
+    // note must belong to the mailbox this run fetched, or account A's
+    // healthy fetch reads account B's notes as vanished and stamps done on
+    // every one of them; and a run that cannot name its mailbox owns none.
     const complete = !(result && result.complete === false);
     const stale = complete && items.length > 0
-      ? reconcileStaleIds(source, allItems, openIds, (it) => scopeAgrees(s._shadow[`${source}:${it.id}`], scope))
+      ? reconcileStaleIds(source, allItems, openIds, (it) => scopeAgrees(s._shadow[shadowKey(source, accountId, it.id)], scope)
+        && ownsNote(it) && !accountMissing)
       : [];
     // Absence alone cannot tell "completed there" from "deleted there", and
     // Tom's rule needs them told apart: the notes are a mirror, so a deleted
@@ -7780,7 +7933,7 @@ class IcorPlannerPlugin extends Plugin {
       }
       // Still open at the source, only outside what the fetch asked for.
       if (openThere.has(it.id)) continue;
-      const key = `${source}:${it.id}`;
+      const key = shadowKey(source, accountId, it.id);
       s._shadow[key] = Object.assign({}, s._shadow[key] || {
         due: it.due, priority: it.priority, description: '',
       }, { done: true, doneAt: nowMs });
@@ -7819,6 +7972,9 @@ class IcorPlannerPlugin extends Plugin {
     if (s.completeOnSource) {
       for (const it of allItems) {
         if (it.source !== source || openIds.has(it.id) || it.reopenPending !== true) continue;
+        // Another account's note is that account's run to retry; a run that
+        // cannot name its mailbox retries nothing.
+        if (accountMissing || !ownsNote(it)) continue;
         // The note is already in the trash: there is nothing left to retry,
         // and this is exactly the loop whose 404 toast came back every five
         // minutes on a deleted task.
@@ -7829,7 +7985,7 @@ class IcorPlannerPlugin extends Plugin {
         // the loop whose 404 came back every five minutes.
         const late = await this.probeGoneIds(source, [it]);
         if (late.has(it.id)) { await this.removeGoneItem(source, it); trashed += 1; continue; }
-        const key = `${source}:${it.id}`;
+        const key = shadowKey(source, accountId, it.id);
         if (s._shadow[key] && s._shadow[key].done === false) continue; // already sent
         try {
           await this.applyDoneOnSource(it, false);
@@ -7846,7 +8002,7 @@ class IcorPlannerPlugin extends Plugin {
     if (rnote) new Notice(rnote, 8000);
     const gnote = goneNotice(SOURCES[source].label, trashed);
     if (gnote) new Notice(gnote, 8000);
-    for (const key of pruneShadows(s._shadow, source, new Set(existing.keys()), openIds, nowMs)) {
+    for (const key of pruneShadows(s._shadow, source, new Set(existing.keys()), openIds, nowMs, undefined, accountId)) {
       delete s._shadow[key];
     }
   }
@@ -7871,7 +8027,7 @@ class IcorPlannerPlugin extends Plugin {
   // setting; this one was not asked for here. The same method serves both discoveries: a probe during reconcile,
   // and a write that came back 404.
   async removeGoneItem(source, item) {
-    const key = `${source}:${item.id}`;
+    const key = shadowKey(source, itemShadowAccount(item), item.id);
     delete this.settings._shadow[key];
     if (this._pushTimers.has(item.path)) {
       window.clearTimeout(this._pushTimers.get(item.path));
@@ -7892,13 +8048,18 @@ class IcorPlannerPlugin extends Plugin {
     if (!this._goneProbed) this._goneProbed = new Set();
     const s = this.withSecrets();
     for (const it of goneProbeBatch(items, GONE_PROBE_MAX_PER_SYNC)) {
-      if (this._goneProbed.has(`${source}:${it.id}`)) continue;
-      this._goneProbed.add(`${source}:${it.id}`);
+      // Keyed by the note's own account (#38, part 3), like removeGoneItem:
+      // a further account's shadow lives under its own key, and the same id
+      // in two mailboxes is two questions. The connector resolves the
+      // mailbox from the note too.
+      const key = shadowKey(source, itemShadowAccount(it), it.id);
+      if (this._goneProbed.has(key)) continue;
+      this._goneProbed.add(key);
       let probe = null;
       // The shadow rides along: it carries what the connector needs to tell
       // "this id is gone" from "this id cannot be asked about any more"
       // (IMAP's UIDVALIDITY today). A connector that needs none ignores it.
-      const probeDeps = Object.assign({}, deps || {}, { shadow: s._shadow ? (s._shadow[`${source}:${it.id}`] || null) : null });
+      const probeDeps = Object.assign({}, deps || {}, { shadow: s._shadow ? (s._shadow[key] || null) : null });
       try { probe = await CONNECTORS[source].probeGone(s, it, probeDeps); } catch { probe = null; }
       const verdict = absenceVerdict(probe);
       if (verdict === 'gone') gone.add(it.id);
@@ -8063,9 +8224,8 @@ class IcorPlannerPlugin extends Plugin {
 
   // The same for a further account (#38, part 2): its own suffixed fields
   // and store keys through a sink that names it, its own /me through its
-  // view, its own granted scopes. No calendar feed and no sync yet: those
-  // are the next part, so until then the account is signed in and stored
-  // and nothing reads its mail.
+  // view, its own granted scopes, and a sync (part 3), which runs that
+  // account's mail on its own view. No calendar feed for it yet.
   async outlookFinishAccountSignIn(tokens, pending, deps) {
     const id = pending.accountId;
     const label = outlookAccountById(this.settings, id).label;
@@ -8077,10 +8237,12 @@ class IcorPlannerPlugin extends Plugin {
       account = trimmed(me.mail) || trimmed(me.userPrincipalName) || trimmed(me.displayName);
     } catch { /* the account line is a nicety; the tokens are what matter */ }
     writeSecret(this.settings, this.secrets, outlookAccountField(id, 'outlookAccount'), account || 'Microsoft account');
+    delete this.syncStatus.outlook;
     await this.saveSettings();
     this.outlookCloseModalFor(pending);
-    new Notice(`Planner: signed in to Outlook (${label})${account ? ` as ${account}` : ''}. Syncing this account comes with a later update.`);
+    new Notice(`Planner: signed in to Outlook (${label})${account ? ` as ${account}` : ''}.`);
     if (pending.onDone) pending.onDone();
+    this.syncNow(false);
   }
   // The sign-in dialog closes for the sign-in it was opened for and for no
   // other: a finished older sign-in never takes a newer dialog down.
@@ -8180,7 +8342,7 @@ class IcorPlannerPlugin extends Plugin {
     // relying on "it has no shadow entry, so it falls out below": that is true
     // today and would stop being true the moment anything else seeds a shadow.
     if (!isSyncedSource(item.source)) return;
-    const key = `${item.source}:${item.id}`;
+    const key = shadowKey(item.source, itemShadowAccount(item), item.id);
     const sh = s._shadow[key];
     // No baseline yet: the next sync seeds it. A pending reopen is the one
     // signal that must act without a shadow (older installs, or a note the
@@ -8261,7 +8423,7 @@ class IcorPlannerPlugin extends Plugin {
   // The name is built from two strings the source chose, and both pass
   // safeBasename: an id is API-assigned and plain in practice, and the note
   // is confined to the folder whatever it carries.
-  async createItemFile(folder, source, t) {
+  async createItemFile(folder, source, t, accountId) {
     let base = `${safeBasename(t.title)} (${source}-${noteIdPart(t.id)})`;
     let path = normalizePath(`${folder}/${base}.md`);
     if (this.app.vault.getAbstractFileByPath(path)) {
@@ -8272,6 +8434,11 @@ class IcorPlannerPlugin extends Plugin {
       'type: planner-item',
       `source: ${source}`,
       `external_id: "${String(t.id).replace(/"/g, '')}"`,
+      // The stamp (#38, part 3), written ONLY for a further account, in the
+      // same write as every other field the note is born with. Absent means
+      // the default, so a one-account vault's notes never gain a line and
+      // every note from before accounts existed is right without a write.
+      ...(accountId && accountId !== OUTLOOK_DEFAULT_ACCOUNT ? [`source_account: ${JSON.stringify(String(accountId))}`] : []),
       `title: ${JSON.stringify(t.title)}`,
       'status: open',
       `due: ${t.due || null}`,
@@ -8296,7 +8463,7 @@ class IcorPlannerPlugin extends Plugin {
     const body = (t.description || '').trim();
     try {
       const created = await this.app.vault.create(path, fmLines.join('\n') + (body ? body + '\n' : ''));
-      this.settings._shadow[`${source}:${t.id}`] = {
+      this.settings._shadow[shadowKey(source, accountId, t.id)] = {
         due: t.due || null, priority: t.priority, description: body, done: false,
       };
       this.markSyncWrite(created || path);
@@ -12033,7 +12200,7 @@ class IcorPlannerSettingTab extends PluginSettingTab {
     });
     // One row per further Microsoft account (#38, part 2): the same
     // sign-in through the same app registration, its own token set, its
-    // own sign-out. Nothing syncs a further account yet.
+    // own sign-out; its mail syncs on its own run (part 3).
     for (const account of accounts.slice(1)) {
       const row = new Setting(containerEl).setName(`Microsoft account: ${account.label}`);
       row.descEl.setAttribute('aria-live', 'polite');
@@ -12053,7 +12220,7 @@ class IcorPlannerSettingTab extends PluginSettingTab {
       accountRefreshers.push((r) => {
         const view = outlookAccountView(r, account);
         const signed = outlookSignedIn(view);
-        row.setDesc(`${outlookStatusText(view)}${signed ? ' Syncing this account comes with a later update.' : ''}`);
+        row.setDesc(outlookStatusText(view));
         inBtn.setButtonText(signed ? 'Sign in again' : 'Sign in');
         inBtn.setDisabled(!trimmed(view.outlookClientId));
         if (!signed) inBtn.setCta(); else inBtn.removeCta();
@@ -12411,6 +12578,12 @@ class IcorPlannerSettingTab extends PluginSettingTab {
           // the moment the feature that uses it is turned on, never before.
           const r = this.plugin.withSecrets();
           if (v && outlookSignedIn(r) && !outlookHasWriteScope(r)) this.plugin.outlookSignIn({ write: true, onDone: () => this.display() });
+          // A further account lacks the permission too until its own "Sign
+          // in again" (#38, part 3): named here, re-consented one at a time
+          // from its row (its status line says so), never several browser
+          // sign-ins at once, since one is in flight at a time.
+          const more = v ? outlookAccountsNeedingWrite(r) : [];
+          if (more.length) new Notice(outlookWriteConsentNotice(more), 12000);
         }));
     new Setting(containerEl)
       .setName('When a recurring task moves to its next date')
@@ -12538,4 +12711,7 @@ module.exports.__test = {
   // more than one Microsoft account: the sign-in (#38, part 2)
   OUTLOOK_ACCOUNT_SECRET_FIELDS, OUTLOOK_ACCOUNT_FIELDS, OUTLOOK_PENDING_TTL_MS, outlookAccountField, outlookAccountFieldParts,
   outlookSecretAccountIds, secretFieldNames, outlookAccountView,
+  // more than one Microsoft account: the sync (#38, part 3)
+  sourceHasAccounts, itemShadowAccount, shadowKey, shadowPrefix, outlookExtraRuns, mergeSyncStatus, outlookItemAccount,
+  outlookAccountsNeedingWrite, outlookWriteConsentNotice, outlookProbeGone,
 };

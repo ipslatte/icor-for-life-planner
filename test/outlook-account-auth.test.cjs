@@ -285,7 +285,7 @@ test('a further account\'s sign-in stores under its keys and leaves the default\
   assert.equal(done, 1);
   assert.equal(p.saved.length, 1);
   assert.ok(!/rt-|at-/.test(p.saved[0]), 'no token in what reaches disk');
-  assert.equal(p.synced, 0, 'no sync for a further account yet: that is the next part');
+  assert.equal(p.synced, 1, 'a further account syncs on its own run once signed in (part 3)');
   assert.deepEqual(s.calendars, [GRAPH_FEED], 'and no calendar feed for it yet');
   assert.equal(T.outlookSignedIn(T.outlookAccountView(T.withSecrets(s, vault), 'work')), true);
   // Sign out of work: its four keys and its scopes go, the default stays.

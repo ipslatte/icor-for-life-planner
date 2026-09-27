@@ -236,11 +236,12 @@ test('the stamp: source_account is read as written, and absent means default', (
   assert.equal(T.itemAccountId({ sourceAccount: 'work' }), 'work');
 });
 
-test('source scan: this step writes no stamp and lays no default under outlookAccounts', () => {
+test('source scan: the stamp has one reader and one writer (part 3, a further account\'s note only), and no default under outlookAccounts', () => {
   const c = code();
   const stampLines = c.split('\n').filter((l) => l.includes('source_account') && !/^\s*(\/\/|\*|\/\*)/.test(l));
-  assert.equal(stampLines.length, 1, 'the reader in itemFromFrontmatter is the one line of code that names the field');
+  assert.equal(stampLines.length, 2, 'the reader in itemFromFrontmatter and the writer in createItemFile are the two lines of code that name the field');
   assert.match(stampLines[0], /^\s*sourceAccount: typeof fm\.source_account === 'string'/);
+  assert.match(stampLines[1], /^\s*\.\.\.\(accountId && accountId !== OUTLOOK_DEFAULT_ACCOUNT \? \[`source_account: /, 'written only for a further account, in the same write as every other field');
   const defaults = c.slice(c.indexOf('const DEFAULT_SETTINGS = {'), c.indexOf('\n};', c.indexOf('const DEFAULT_SETTINGS = {')));
   assert.doesNotMatch(defaults, /outlookAccounts/, 'no default under the key, so no save adds it');
   // The list is read through one function and nowhere else, so the shape
