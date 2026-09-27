@@ -543,6 +543,112 @@ test('a note that lost its stamp is left alone by the default\'s run when its id
   assert.match(code(), /const ownsNote = \(it\) => stampedForRun\(it\) && !shadowedByOtherAccount\(s, s\._shadow, source, it\);/, 'the guard is folded into ownsNote, so the existing map, the reconcile predicate and the reopen retry all read it');
 });
 
+test('the other account\'s prune keeps a shadow an unstamped note still maps to, so the protection lasts as long as the note; once the note is gone the key goes', async () => {
+  // Vex's three-sync sequence: w1 lost its stamp AND its mail left work's
+  // flagged set before work's next run. Sync 1 (work): no work-stamped note
+  // carries w1 and w1 is not in the open set, so before this fix the prune
+  // dropped `outlook@work:w1`, the one record that says whose the note is.
+  // Sync 2 (default): with the key gone the default owned w1 again, probed
+  // the default mailbox and trashed the note. Now the key is anchored by the
+  // unstamped note and every sync leaves w1 alone.
+  const d1 = note('d1');
+  const w1 = note('w1', { planned_day: '2026-09-28' });
+  const shadows = { 'outlook:d1': sh(), 'outlook@work:w1': sh() };
+  const { p, trashed, created, byPath } = plugin(settingsFor(THREE, { _shadow: shadows }), [d1, w1]);
+  const before = JSON.stringify(w1.fm);
+  await recording(async (log) => {
+    for (let round = 1; round <= 3; round += 1) {
+      await p.upsertSource('outlook', { ok: true, items: [], account: 'work' });
+      assert.ok(p.settings._shadow['outlook@work:w1'], `sync ${round}: work's prune keeps the key the unstamped note maps to`);
+      await p.upsertSource('outlook', { ok: true, items: [mail('d1')], account: 'default' });
+      assert.deepEqual(log.probed, [], `sync ${round}: the default never asks its mailbox about w1`);
+      assert.deepEqual(trashed, [], `sync ${round}: nothing trashed`);
+      assert.equal(JSON.stringify(w1.fm), before, `sync ${round}: w1 byte for byte`);
+    }
+    assert.equal(created.length, 0, 'the mail is not flagged any more, so work makes no copy either');
+    // The note itself removed by the member: nothing maps to the key any
+    // more, and work's next prune drops it, as it always did.
+    byPath.delete(w1.path);
+    p.app.vault.getAbstractFileByPath = (path) => (path === ROOT ? { children: [] } : null);
+    const root = new TFolder(); root.path = ROOT; const dir = new TFolder(); dir.path = OUTLOOK; dir.children = [d1]; root.children = [dir];
+    p.app.vault.getAbstractFileByPath = (path) => (path === ROOT ? root : (path === d1.path ? d1 : null));
+    await p.upsertSource('outlook', { ok: true, items: [], account: 'work' });
+    assert.equal(p.settings._shadow['outlook@work:w1'], undefined, 'no note maps to it: dropped');
+    assert.ok(p.settings._shadow['outlook:d1'], 'the default\'s key is not work\'s to prune');
+  }, { probe: () => true });
+  // The pure pieces. anchoredShadowIds: unstamped notes of the source whose
+  // id the map keys under THIS further account; never for the default, for
+  // another source, for a stamped note, or for an id keyed elsewhere.
+  const it = (id, over) => Object.assign({ source: 'outlook', id }, over || {});
+  const map = { 'outlook@work:w1': sh(), 'outlook@work:w2': sh({ done: true, doneAt: 0 }), 'outlook@old:o1': sh(), 'outlook:d1': sh() };
+  const notes = [it('w1'), it('w2'), it('o1'), it('d1'), it('w3'), it('w1', { sourceAccount: 'work' }), it('t1', { source: 'todoist' }), null];
+  assert.deepEqual([...T.anchoredShadowIds(map, 'outlook', 'work', notes)].sort(), ['w1', 'w2']);
+  assert.deepEqual([...T.anchoredShadowIds(map, 'outlook', 'old', notes)], ['o1'], 'switched off counts: its key is still the evidence');
+  assert.deepEqual([...T.anchoredShadowIds(map, 'outlook', 'default', notes)], [], 'the default anchors nothing');
+  assert.deepEqual([...T.anchoredShadowIds(map, 'outlook', null, notes)], []);
+  assert.deepEqual([...T.anchoredShadowIds(map, 'todoist', 'work', notes)], [], 'no other source has accounts');
+  assert.deepEqual([...T.anchoredShadowIds(null, 'outlook', 'work', notes)], []);
+  // pruneShadows: an anchored id survives the orphan drop and the age drop;
+  // the seven-argument call is what it was.
+  const now = 10 * 24 * 3600 * 1000 * 100;
+  assert.deepEqual(T.pruneShadows(map, 'outlook', new Set(), new Set(), now, undefined, 'work'), ['outlook@work:w1', 'outlook@work:w2'], 'without anchors, both go');
+  assert.deepEqual(T.pruneShadows(map, 'outlook', new Set(), new Set(), now, undefined, 'work', new Set(['w1', 'w2'])), [], 'anchored: kept, the old done one too');
+  assert.deepEqual(T.pruneShadows(map, 'outlook', new Set(), new Set(), now, undefined, 'work', new Set(['w1'])), ['outlook@work:w2']);
+  assert.deepEqual(T.pruneShadows(map, 'outlook', new Set(['a']), new Set(['a']), now), ['outlook:d1'], 'the default\'s five-argument prune is untouched');
+  // One account listed, both shapes: a stray `outlook@work:` key anchors
+  // nothing for the default's run and the run is what it was.
+  for (const accounts of [null, [{ accountId: 'default', label: 'Personal' }]]) {
+    const x1 = note('x1');
+    const { p: q, trashed: t } = plugin(settingsFor(accounts, { _shadow: { 'outlook@work:x1': sh() } }), [x1]);
+    assert.deepEqual([...T.anchoredShadowIds(q.settings._shadow, 'outlook', 'default', [{ source: 'outlook', id: 'x1' }])], []);
+    await recording(async (log) => {
+      await q.upsertSource('outlook', { ok: true, items: [mail('d1')], account: 'default' });
+      assert.deepEqual(log.probed, [['x1', 'default']]);
+      assert.deepEqual(t, [x1.path]);
+    }, { probe: () => true });
+  }
+});
+
+test('the edit route: an unstamped note keyed under another listed account with a pending reopen is not patched against the default mailbox and not trashed; a stamped note and a one-account vault are as before', async () => {
+  const wr = note('wr', { status: 'done', done_local: false, reopen_pending: true });
+  const ws = note('ws', { source_account: 'work', status: 'done', done_local: false, reopen_pending: true });
+  const shadows = { 'outlook@work:wr': sh({ done: true }), 'outlook@work:ws': sh({ done: true }) };
+  const { p, trashed } = plugin(settingsFor(THREE, { _shadow: shadows }), [wr, ws]);
+  p.isSyncWrite = () => false;
+  p._shadowSaveTimer = null;
+  p.persistSettings = async () => { };
+  const before = JSON.stringify(wr.fm);
+  const hadWindow = 'window' in globalThis;
+  if (!hadWindow) globalThis.window = { setTimeout: () => 0, clearTimeout: () => { } };
+  try {
+    await recording(async (log) => {
+      T.CONNECTORS.outlook.setClosed = async () => { throw T.goneError('Outlook'); };
+      await p.detectAndPush(wr.path);
+      assert.deepEqual(trashed, [], 'the lost-stamp note is not trashed');
+      assert.equal(JSON.stringify(wr.fm), before, 'and not touched');
+      assert.ok(p.settings._shadow['outlook@work:wr']);
+      // The stamped note takes the same route as before: work's mailbox is
+      // asked (through the note's own account), answers gone, the note goes.
+      await p.detectAndPush(ws.path);
+      assert.deepEqual(trashed, [ws.path]);
+      assert.equal(p.settings._shadow['outlook@work:ws'], undefined);
+    });
+    // One account, either shape: a stray key under an unlisted account is
+    // not looked under, so the reopen goes to the default mailbox as before.
+    for (const accounts of [null, [{ accountId: 'default', label: 'Personal' }]]) {
+      const xr = note('xr', { status: 'done', done_local: false, reopen_pending: true });
+      const { p: q, trashed: t } = plugin(settingsFor(accounts, { _shadow: { 'outlook@work:xr': sh({ done: true }) } }), [xr]);
+      q.isSyncWrite = () => false; q.persistSettings = async () => { };
+      await recording(async (log) => {
+        T.CONNECTORS.outlook.setClosed = async () => { throw T.goneError('Outlook'); };
+        await q.detectAndPush(xr.path);
+        assert.deepEqual(t, [xr.path], 'as before this fix');
+      });
+    }
+  } finally { if (!hadWindow) delete globalThis.window; }
+  assert.match(code(), /if \(!isSyncedSource\(item\.source\)\) return;\n\s*if \(shadowedByOtherAccount\(s, s\._shadow, item\.source, item\)\) return;\n\s*const key = shadowKey\(item\.source, itemShadowAccount\(item\), item\.id\);/, 'the guard sits before any key is read or any call is made');
+});
+
 test('source scan: the pins the sync core keeps, and every shadow key in the class goes through shadowKey', () => {
   const c = code();
   const cls = c.slice(c.indexOf('class IcorPlannerPlugin'), c.indexOf('class IcorPlannerSettingTab'));
@@ -555,7 +661,7 @@ test('source scan: the pins the sync core keeps, and every shadow key in the cla
   assert.match(c, /if \(accountMissing \|\| !ownsNote\(it\)\) continue;/, 'and in the reopen retry');
   assert.match(c, /else await this\.createItemFile\(folder, source, t\);/, 'the default\'s create is the literal call');
   assert.match(c, /await this\.createItemFile\(folder, source, t, accountId\);/);
-  assert.match(c, /pruneShadows\(s\._shadow, source, new Set\(existing\.keys\(\)\), openIds, nowMs, undefined, accountId\)/);
+  assert.match(c, /const anchored = anchoredShadowIds\(s\._shadow, source, accountId, allItems\);\n\s*for \(const key of pruneShadows\(s\._shadow, source, new Set\(existing\.keys\(\)\), openIds, nowMs, undefined, accountId, anchored\)\)/, 'the prune keeps the keys an unstamped note still maps to');
   for (const fn of ['async removeGoneItem(source, item) {\n    const key = shadowKey(source, itemShadowAccount(item), item.id);', 'const key = shadowKey(source, itemShadowAccount(it), it.id);\n      if (this._goneProbed.has(key)) continue;', 'const key = shadowKey(item.source, itemShadowAccount(item), item.id);\n    const sh = s._shadow[key];']) {
     assert.ok(cls.includes(fn), fn);
   }

@@ -2622,6 +2622,22 @@ function shadowPrefix(source, accountId) {
 // writer, the create. Only an unstamped note of the source with accounts
 // can answer true, and with one account listed there is no other key to
 // look under, so nothing changes for a one-account vault.
+// The ids a FURTHER account's prune must keep although no note of its own
+// carries them: the unstamped notes of the source whose id the map keys
+// under that account. Such a note lost its stamp; the key is what keeps the
+// default's run off it (shadowedByOtherAccount), so the key must last as
+// long as the note does, not as long as the mail stays flagged. The default
+// and every other source anchor nothing: their notes are their own.
+function anchoredShadowIds(shadowMap, source, accountId, items) {
+  const out = new Set();
+  if (!sourceHasAccounts(source) || !accountId || accountId === OUTLOOK_DEFAULT_ACCOUNT) return out;
+  const map = shadowMap || {};
+  for (const it of items || []) {
+    if (!it || it.source !== source || itemAccountId(it) !== OUTLOOK_DEFAULT_ACCOUNT) continue;
+    if (map[shadowKey(source, accountId, it.id)]) out.add(it.id);
+  }
+  return out;
+}
 function shadowedByOtherAccount(settings, shadowMap, source, item) {
   if (!sourceHasAccounts(source) || !item || itemAccountId(item) !== OUTLOOK_DEFAULT_ACCOUNT) return false;
   const map = shadowMap || {};
@@ -5223,7 +5239,7 @@ function ghostItemsFor(items) {
 // pruned by two rules instead: no note carries the id any more, or the done
 // shadow is older than `maxDoneAgeMs`. Returns the keys to drop.
 const DONE_SHADOW_MAX_AGE_MS = 90 * 86400000;
-function pruneShadows(shadowMap, source, existingIds, openIds, nowMs, maxDoneAgeMs, accountId) {
+function pruneShadows(shadowMap, source, existingIds, openIds, nowMs, maxDoneAgeMs, accountId, anchoredIds) {
   const maxAge = Number.isFinite(maxDoneAgeMs) ? maxDoneAgeMs : DONE_SHADOW_MAX_AGE_MS;
   const drop = [];
   // Scoped to the account whose ids were passed in (#38, part 3): a run
@@ -5234,6 +5250,10 @@ function pruneShadows(shadowMap, source, existingIds, openIds, nowMs, maxDoneAge
   for (const key of Object.keys(shadowMap || {})) {
     if (!key.startsWith(prefix)) continue;
     const id = key.slice(prefix.length);
+    // A key an unstamped note still maps to (anchoredShadowIds) is the one
+    // record that says whose the note is; it lives as long as the note,
+    // through this drop and the age drop below.
+    if (anchoredIds && anchoredIds.has(id)) continue;
     const sh = shadowMap[key] || {};
     if (!existingIds.has(id) && !openIds.has(id)) { drop.push(key); continue; }
     if (sh.done === true && Number.isFinite(sh.doneAt) && nowMs - sh.doneAt > maxAge) drop.push(key);
@@ -8028,7 +8048,12 @@ class IcorPlannerPlugin extends Plugin {
     if (rnote) new Notice(rnote, 8000);
     const gnote = goneNotice(SOURCES[source].label, trashed);
     if (gnote) new Notice(gnote, 8000);
-    for (const key of pruneShadows(s._shadow, source, new Set(existing.keys()), openIds, nowMs, undefined, accountId)) {
+    // This run's shadows: its own notes' and its open set's, plus the keys an
+    // unstamped note still maps to under this account (anchoredShadowIds),
+    // which are the evidence the default's run reads and must outlive the
+    // mail leaving the flagged set.
+    const anchored = anchoredShadowIds(s._shadow, source, accountId, allItems);
+    for (const key of pruneShadows(s._shadow, source, new Set(existing.keys()), openIds, nowMs, undefined, accountId, anchored)) {
       delete s._shadow[key];
     }
   }
@@ -8368,6 +8393,11 @@ class IcorPlannerPlugin extends Plugin {
     // relying on "it has no shadow entry, so it falls out below": that is true
     // today and would stop being true the moment anything else seeds a shadow.
     if (!isSyncedSource(item.source)) return;
+    // The edit route is the third route to the mailbox (a pending reopen
+    // patches at once). An unstamped note the map keys under another listed
+    // account is not the default's to patch, and a 404 from the default
+    // mailbox would trash it: the same rule the sync runs read.
+    if (shadowedByOtherAccount(s, s._shadow, item.source, item)) return;
     const key = shadowKey(item.source, itemShadowAccount(item), item.id);
     const sh = s._shadow[key];
     // No baseline yet: the next sync seeds it. A pending reopen is the one
@@ -12739,5 +12769,5 @@ module.exports.__test = {
   outlookSecretAccountIds, secretFieldNames, outlookAccountView,
   // more than one Microsoft account: the sync (#38, part 3)
   sourceHasAccounts, itemShadowAccount, shadowKey, shadowPrefix, outlookExtraRuns, mergeSyncStatus, outlookItemAccount,
-  outlookAccountsNeedingWrite, outlookWriteConsentNotice, outlookProbeGone, shadowedByOtherAccount,
+  outlookAccountsNeedingWrite, outlookWriteConsentNotice, outlookProbeGone, shadowedByOtherAccount, anchoredShadowIds,
 };
