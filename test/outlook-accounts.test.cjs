@@ -123,7 +123,9 @@ test('THE ASK (#38, point 4): the secret key list is the same with no key, with 
   const keys = (s) => T.secretSlots(s).map((slot) => [slot.id, slot.envKey, slot.ids]);
   const base = { calendars: [GRAPH_FEED] };
   assert.deepEqual(keys(Object.assign({}, base, { outlookAccounts: DEFAULT_ONLY })), keys(base));
-  assert.deepEqual(keys(Object.assign({}, base, { outlookAccounts: TWO })), keys(base), 'this step adds no key for a second account; that is the sign-in step');
+  // A second account adds its own keys after the ones every member has
+  // (part 2, the sign-in); the first five never move or change.
+  assert.deepEqual(keys(Object.assign({}, base, { outlookAccounts: TWO })).slice(0, 5), keys(base).slice(0, 5), 'the five credentials by name are what they were');
   assert.deepEqual(Object.keys(T.SECRET_FIELDS), ['todoistToken', 'clickupToken', 'imapPassword', 'outlookRefreshToken', 'outlookAccessToken', 'outlookExpiresAt', 'outlookAccount']);
   assert.equal(T.settingsHoldSecrets({ outlookAccounts: TWO, calendars: [] }), false, 'the list holds no secret');
 });

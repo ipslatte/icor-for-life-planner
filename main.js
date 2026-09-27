@@ -403,8 +403,13 @@ function secretKey(suffix) {
   return SECRET_KEY_PREFIX + (slug || 'unnamed');
 }
 function fieldSecretKey(field) {
-  if (!SECRET_FIELDS[field]) throw new Error(`not a secret field: ${field}`);
-  return secretKey(SECRET_FIELDS[field]);
+  if (SECRET_FIELDS[field]) return secretKey(SECRET_FIELDS[field]);
+  // A further Microsoft account's field: the same suffix with the account
+  // id appended (#38, part 2). The id passed the rule that keeps it from
+  // being folded here, so the key is the field's key plus `-<accountId>`.
+  const parts = outlookAccountFieldParts(field);
+  if (parts) return secretKey(`${SECRET_FIELDS[parts.field]}-${parts.accountId}`);
+  throw new Error(`not a secret field: ${field}`);
 }
 function calendarSecretKey(feedId) { return secretKey(`calendar-${feedId}`); }
 
@@ -529,7 +534,7 @@ function migrateSecrets(settings, vault) {
   let changed = false;
   if (Object.prototype.hasOwnProperty.call(s, 'icsUrl')) { delete s.icsUrl; changed = true; }
   if (!vault || !vault.available()) return { changed, moved };
-  for (const field of SECRET_FIELD_NAMES) {
+  for (const field of secretFieldNames(s)) {
     const v = trimmed(s[field]);
     if (!v) continue;
     if (!vault.set(fieldSecretKey(field), v)) continue;
@@ -556,7 +561,7 @@ function migrateSecrets(settings, vault) {
 // Whether the settings object still carries a secret in any field or feed.
 function settingsHoldSecrets(settings) {
   const s = settings || {};
-  if (SECRET_FIELD_NAMES.some((field) => trimmed(s[field]))) return true;
+  if (secretFieldNames(s).some((field) => trimmed(s[field]))) return true;
   // Through the accessor: with no vault given it answers the entry's own address.
   return Array.isArray(s.calendars) && s.calendars.some((f) => f && typeof f === 'object' && !!feedUrl(f));
 }
@@ -571,7 +576,7 @@ async function migrateSecretsSettled(settings, vault) {
   if (!vault || !vault.available() || vault.immediate) return r;
   const s = settings || {};
   const slots = [];
-  for (const field of SECRET_FIELD_NAMES) {
+  for (const field of secretFieldNames(s)) {
     const v = trimmed(s[field]);
     if (v) slots.push({ obj: s, prop: field, name: field, key: fieldSecretKey(field), value: v });
   }
@@ -610,7 +615,7 @@ function withSecrets(settings, vault) {
   Object.defineProperty(s, '_live', { value: settings || null, enumerable: false });
   Object.defineProperty(s, '_vault', { value: vault || null, enumerable: false });
   if (!vault || !vault.available()) return s;
-  for (const field of SECRET_FIELD_NAMES) {
+  for (const field of secretFieldNames(s)) {
     if (trimmed(s[field])) continue;
     const v = vault.get(fieldSecretKey(field));
     if (v) s[field] = v;
@@ -848,7 +853,7 @@ class EnvFileStore {
 function dataJsonStore(settings) {
   const s = settings || {};
   const slot = (id) => {
-    for (const field of SECRET_FIELD_NAMES) if (fieldSecretKey(field) === id) return { obj: s, prop: field };
+    for (const field of secretFieldNames(s)) if (fieldSecretKey(field) === id) return { obj: s, prop: field };
     for (const f of (Array.isArray(s.calendars) ? s.calendars : [])) {
       if (f && typeof f === 'object' && f.id && calendarSecretKey(f.id) === id) return { obj: f, prop: 'url' };
     }
@@ -910,6 +915,17 @@ function secretSlots(settings) {
     const id = fieldSecretKey(field);
     return { id, label: SECRET_SLOT_LABELS[field], envKey: envKeyFor(id), ids: [field].concat(SECRET_SLOT_COMPANIONS[field] || []).map(fieldSecretKey) };
   });
+  // Two more rows per further Microsoft account, named by its label (#38,
+  // part 2); an account no longer listed still gets its rows, so its keys
+  // can be seen and moved.
+  for (const accountId of outlookSecretAccountIds(settings)) {
+    const label = outlookAccountById(settings, accountId).label;
+    for (const field of ['outlookRefreshToken', 'outlookAccessToken']) {
+      const id = fieldSecretKey(outlookAccountField(accountId, field));
+      const ids = [field].concat(SECRET_SLOT_COMPANIONS[field] || []).map((f) => fieldSecretKey(outlookAccountField(accountId, f)));
+      slots.push({ id, label: `${SECRET_SLOT_LABELS[field]} (${label})`, envKey: envKeyFor(id), ids });
+    }
+  }
   for (const f of calendarFeeds(settings)) {
     if (!f || !f.id || f.kind === 'graph') continue;
     const id = calendarSecretKey(f.id);
@@ -2085,6 +2101,8 @@ const OUTLOOK_SCOPES_READ = ['offline_access', 'openid', 'profile', 'Mail.Read',
 const OUTLOOK_SCOPES_WRITE = ['offline_access', 'openid', 'profile', 'Mail.Read', 'Mail.ReadWrite', 'Calendars.Read'];
 // Refresh this long before the access token's stated expiry.
 const OUTLOOK_TOKEN_SLACK_MS = 60000;
+// How long a started sign-in waits for its reply before it is forgotten.
+const OUTLOOK_PENDING_TTL_MS = 15 * 60000;
 // The notice under the client id field. Shipped exactly as given.
 const OUTLOOK_NOTICE = 'You are creating this in your own Microsoft account. Paperless Movement, S.L. never sees or stores your client id or token; you are bound by Microsoft\'s developer terms for it.';
 const OUTLOOK_GUIDE_URL = 'https://github.com/myICOR/icor-for-life-planner/blob/main/docs/outlook-setup-guide.md';
@@ -2458,6 +2476,91 @@ function itemAccountId(item) {
   return v || OUTLOOK_DEFAULT_ACCOUNT;
 }
 
+/* ---- more than one Microsoft account: the sign-in (#38, part 2) ---------
+ * One sign-in and one set of store keys per account, through the one app
+ * registration (the flat client id and tenant serve every account). The
+ * `default` account IS the flat outlook* fields and the four store keys
+ * members already hold, byte for byte. Another account's values live in
+ * the SAME flat settings namespace under a suffixed field name
+ * (`outlookRefreshToken__work`), and its store key carries the id as a
+ * suffix (`icor-for-life-planner-outlook-refresh-token-work`, env key
+ * OUTLOOK_REFRESH_TOKEN_WORK). Flat on purpose: the six functions that
+ * walk the secret fields (the migrator, the settled migrator, the audit,
+ * the resolver, the data.json store and the key list) take their list from
+ * secretFieldNames() below and so move, list, fill and clear a second
+ * refresh token by exactly the rules the first one obeys, without knowing
+ * that accounts exist. A token kept on the account record would be
+ * invisible to all six and sit in data.json forever, unmoved and unlisted.
+ */
+const OUTLOOK_ACCOUNT_SECRET_FIELDS = ['outlookRefreshToken', 'outlookAccessToken', 'outlookExpiresAt', 'outlookAccount'];
+// The granted scopes are per sign-in too, so per account; not a secret.
+const OUTLOOK_ACCOUNT_FIELDS = OUTLOOK_ACCOUNT_SECRET_FIELDS.concat(['outlookScopes']);
+const OUTLOOK_ACCOUNT_FIELD_SEP = '__';
+// The settings field that holds one account's value of one flat field. The
+// default keeps the bare name, so nothing is renamed for anyone.
+function outlookAccountField(accountId, field) {
+  if (!OUTLOOK_ACCOUNT_FIELDS.includes(field)) throw new Error(`not an account field: ${field}`);
+  const id = accountId == null || accountId === '' ? OUTLOOK_DEFAULT_ACCOUNT : String(accountId);
+  if (id === OUTLOOK_DEFAULT_ACCOUNT) return field;
+  if (!outlookAccountId(id)) throw new Error('not an account id');
+  return `${field}${OUTLOOK_ACCOUNT_FIELD_SEP}${id}`;
+}
+// The strict inverse, for a SECRET field only: { field, accountId } for
+// `outlookRefreshToken__work`; null for a bare field, for a field that is
+// not a secret (`outlookScopes__work`), and for an id the rule refuses.
+function outlookAccountFieldParts(name) {
+  const at = typeof name === 'string' ? name.indexOf(OUTLOOK_ACCOUNT_FIELD_SEP) : -1;
+  if (at <= 0) return null;
+  const field = name.slice(0, at);
+  const accountId = outlookAccountId(name.slice(at + OUTLOOK_ACCOUNT_FIELD_SEP.length));
+  if (!OUTLOOK_ACCOUNT_SECRET_FIELDS.includes(field) || !accountId || accountId === OUTLOOK_DEFAULT_ACCOUNT) return null;
+  return { field, accountId };
+}
+// Whose keys the secret layer walks: every listed account but the default,
+// then any account whose suffixed field still carries a value in these
+// settings (a record removed before its sign-out, a data.json synced in
+// from another device), so a token is never left unmoved and unlisted.
+function outlookSecretAccountIds(settings) {
+  const s = settings || {};
+  const ids = outlookAccountList(s).map((a) => a.accountId).filter((id) => id !== OUTLOOK_DEFAULT_ACCOUNT);
+  const orphans = [];
+  for (const k of Object.keys(s)) {
+    const p = outlookAccountFieldParts(k);
+    if (p && trimmed(s[k]) && !ids.includes(p.accountId) && !orphans.includes(p.accountId)) orphans.push(p.accountId);
+  }
+  return ids.concat(orphans.sort());
+}
+// The secret fields the layer walks for these settings: the seven of
+// SECRET_FIELDS, then four per further account. With no further account
+// this is SECRET_FIELD_NAMES and nothing else.
+function secretFieldNames(settings) {
+  const out = SECRET_FIELD_NAMES.slice();
+  for (const id of outlookSecretAccountIds(settings)) for (const f of OUTLOOK_ACCOUNT_SECRET_FIELDS) out.push(outlookAccountField(id, f));
+  return out;
+}
+// One account seen as the flat shape every Outlook function reads. The
+// default answers the settings object ITSELF, not a copy: the path every
+// member is on today stays the same object. Another account gets a shallow
+// copy with the five account fields replaced by its own, the hidden links
+// carried across (`_live`, `_vault`, from withSecrets) and `_account`
+// added, so a token that rotates inside a connector lands under that
+// account's suffixed field in the live settings or the store, never on the
+// default's keys and never on this copy. An id the rule refuses reads as
+// not signed in.
+function outlookAccountView(settings, account) {
+  const s = settings || {};
+  const raw = account && typeof account === 'object' ? account.accountId : account;
+  const id = raw == null || raw === '' ? OUTLOOK_DEFAULT_ACCOUNT : String(raw);
+  if (id === OUTLOOK_DEFAULT_ACCOUNT) return s;
+  const valid = !!outlookAccountId(id);
+  const view = Object.assign({}, s);
+  for (const f of OUTLOOK_ACCOUNT_FIELDS) view[f] = valid ? trimmed(s[outlookAccountField(id, f)]) : '';
+  Object.defineProperty(view, '_live', { value: s._live || s, enumerable: false });
+  Object.defineProperty(view, '_vault', { value: s._vault || null, enumerable: false });
+  Object.defineProperty(view, '_account', { value: id, enumerable: false });
+  return view;
+}
+
 /* ---- the stored sign-in ---- */
 function outlookSignedIn(settings) {
   const s = settings || {};
@@ -2481,8 +2584,12 @@ function outlookTokens(settings) {
 // run reads the rotated token, never the one Microsoft just retired.
 function outlookTokenSink(s) {
   const view = s || {};
-  return { live: view._live || view, vault: view._vault || null, view };
+  return { live: view._live || view, vault: view._vault || null, view, account: view._account || OUTLOOK_DEFAULT_ACCOUNT };
 }
+// The account a sink writes for: absent means the default, whose fields
+// are the bare ones. On the view the field is always the bare one, because
+// the view is that account's flat shape.
+function sinkAccount(k) { return k.account == null || k.account === '' ? OUTLOOK_DEFAULT_ACCOUNT : String(k.account); }
 // Persist what a token response carried. The refresh token rotates: a new
 // one overwrites the stored one; an absent one leaves it untouched.
 function saveOutlookTokens(sink, tokens, now) {
@@ -2491,8 +2598,9 @@ function saveOutlookTokens(sink, tokens, now) {
   const t = tokens || {};
   const at = (now == null ? Date.now() : now) + Math.max(0, Number(t.expiresIn) || 0) * 1000;
   let held = true;
+  const acct = sinkAccount(k);
   const put = (field, value) => {
-    held = writeSecret(live, k.vault, field, value) && held;
+    held = writeSecret(live, k.vault, outlookAccountField(acct, field), value) && held;
     if (k.view && k.view !== live) k.view[field] = value;
   };
   put('outlookAccessToken', t.accessToken ? String(t.accessToken) : '');
@@ -2504,12 +2612,14 @@ function saveOutlookTokens(sink, tokens, now) {
   // now, not at the next save that happens to come along.
   if (!held && typeof live._persist === 'function') live._persist();
 }
-// Sign-out: the four keys cleared, in the store or in the settings.
+// Sign-out: the four keys cleared, in the store or in the settings. With an
+// `account` on the sink, that account's four; every other account's stay.
 function clearOutlookTokens(sink) {
   const k = sink || {};
   const live = k.live || {};
-  for (const f of ['outlookRefreshToken', 'outlookAccessToken', 'outlookExpiresAt', 'outlookAccount']) {
-    writeSecret(live, k.vault, f, '');
+  const acct = sinkAccount(k);
+  for (const f of OUTLOOK_ACCOUNT_SECRET_FIELDS) {
+    writeSecret(live, k.vault, outlookAccountField(acct, f), '');
     if (k.view && k.view !== live) k.view[f] = '';
   }
   if (!(k.vault && k.vault.available()) && typeof live._persist === 'function') live._persist();
@@ -7822,8 +7932,39 @@ class IcorPlannerPlugin extends Plugin {
     return { visibleWeekStarts: weeks };
   }
 
+  // Sign-ins in flight, keyed by the state nonce each one issued (#38,
+  // part 2). The one protocol handler answers every account, and a reply
+  // finds its own sign-in by the state it carries, never the latest one
+  // started. An entry nobody answers is dropped after the TTL.
+  outlookPendingMap() {
+    if (!(this._outlookPending instanceof Map)) this._outlookPending = new Map();
+    return this._outlookPending;
+  }
+  outlookSweepPending(now) {
+    const map = this.outlookPendingMap();
+    const t = now == null ? Date.now() : now;
+    for (const [state, p] of map) if (!p || t - Number(p.startedAt || 0) > OUTLOOK_PENDING_TTL_MS) map.delete(state);
+    return map;
+  }
+  outlookRememberPending(pending, now) {
+    const p = Object.assign({ startedAt: now == null ? Date.now() : now }, pending);
+    this.outlookSweepPending(now).set(p.state, p);
+    return p;
+  }
+  // Every sign-in waiting for one account, or all of them, forgotten.
+  outlookClearPending(accountId) {
+    const map = this.outlookPendingMap();
+    for (const [state, p] of map) if (accountId == null || (p && p.accountId === accountId)) map.delete(state);
+  }
+
   async outlookSignIn(opts) {
     const o = opts || {};
+    // Which account this sign-in is for: the default unless asked, and
+    // only an account the list carries. Sign-in is allowed for a disabled
+    // account (enabled governs the sync, not the credential).
+    const wanted = o.accountId == null || o.accountId === '' ? OUTLOOK_DEFAULT_ACCOUNT : String(o.accountId);
+    const account = outlookAccountList(this.settings).find((a) => a.accountId === wanted);
+    if (!account) { new Notice(`Planner: "${wanted}" is not a listed Microsoft account; add it under outlookAccounts in the plugin's data.json first.`); return; }
     const clientId = trimmed(this.settings.outlookClientId);
     if (!clientId) { new Notice('Planner: paste your Application (client) ID under Outlook first.'); return; }
     // Mail.ReadWrite is asked for only once Complete on source is on: the
@@ -7834,18 +7975,20 @@ class IcorPlannerPlugin extends Plugin {
     const { verifier, challenge } = await pkcePair();
     const state = randomState();
     const url = authorizeUrl({ clientId, tenant, scopes, redirectUri: OUTLOOK_REDIRECT_URI, state, challenge });
-    this._outlookPending = { state, verifier, clientId, tenant, scopes, onDone: typeof o.onDone === 'function' ? o.onDone : null };
+    const pending = this.outlookRememberPending({ state, verifier, clientId, tenant, scopes, accountId: account.accountId, onDone: typeof o.onDone === 'function' ? o.onDone : null });
     if (this._outlookModal) this._outlookModal.close();
-    this._outlookModal = new OutlookSignInModal(this.app, this, { url });
+    const title = account.accountId === OUTLOOK_DEFAULT_ACCOUNT ? 'Sign in to Outlook' : `Sign in to Outlook (${account.label})`;
+    this._outlookModal = new OutlookSignInModal(this.app, this, { url, pending, title });
     this._outlookModal.open();
     window.open(url, '_external');
   }
 
   // The protocol handler's target. `params` is what Obsidian parsed off the
   // obsidian:// URL: code and state on success, error and error_description
-  // when Microsoft declined.
-  async outlookAuthCallback(params) {
-    const pending = this._outlookPending;
+  // when Microsoft declined. The state names the sign-in it answers.
+  async outlookAuthCallback(params, deps) {
+    const state = trimmed(params && params.state);
+    const pending = state ? this.outlookSweepPending().get(state) || null : null;
     const modal = this._outlookModal;
     const parsed = parseAuthCallback(params, pending ? pending.state : null);
     if (!parsed.ok) {
@@ -7853,14 +7996,14 @@ class IcorPlannerPlugin extends Plugin {
       if (modal) modal.setStatus(text, true); else new Notice(text, 10000);
       return;
     }
-    this._outlookPending = null;
+    this.outlookPendingMap().delete(pending.state);
     if (modal) modal.setStatus('Signed in. Finishing up...', false);
     try {
       const tokens = await tokenExchange({
         clientId: pending.clientId, tenant: pending.tenant, code: parsed.code,
         redirectUri: OUTLOOK_REDIRECT_URI, verifier: pending.verifier, scopes: pending.scopes,
-      });
-      await this.outlookFinishSignIn(tokens, pending);
+      }, deps);
+      await this.outlookFinishSignIn(tokens, pending, deps);
     } catch (e) {
       const text = `Outlook sign-in failed: ${(e && e.message) || e}${e && e.hint ? ` ${e.hint}` : ''}`;
       if (modal) modal.setStatus(text, true);
@@ -7869,19 +8012,20 @@ class IcorPlannerPlugin extends Plugin {
   }
 
   // The fallback: a code typed on any device, polled here until Microsoft
-  // confirms, gives up, or the modal is closed.
+  // confirms, gives up, or the modal is closed. The modal knows which
+  // sign-in it was opened for.
   async outlookDeviceSignIn() {
-    const pending = this._outlookPending;
     const modal = this._outlookModal;
+    const pending = modal ? modal.pending : null;
     if (!pending || !modal) return;
     try {
       const dc = await deviceCodeStart({ clientId: pending.clientId, tenant: pending.tenant, scopes: pending.scopes });
       modal.showDeviceCode(dc);
       const tokens = await deviceCodePoll(
         { clientId: pending.clientId, tenant: pending.tenant, deviceCode: dc.deviceCode, interval: dc.interval, expiresIn: dc.expiresIn },
-        { cancelled: () => modal.closed || this._outlookPending !== pending },
+        { cancelled: () => modal.closed || this.outlookPendingMap().get(pending.state) !== pending },
       );
-      this._outlookPending = null;
+      this.outlookPendingMap().delete(pending.state);
       await this.outlookFinishSignIn(tokens, pending);
     } catch (e) {
       if (e && e.reason === 'cancelled') return;
@@ -7891,7 +8035,8 @@ class IcorPlannerPlugin extends Plugin {
     }
   }
 
-  async outlookFinishSignIn(tokens, pending) {
+  async outlookFinishSignIn(tokens, pending, deps) {
+    if (pending && pending.accountId && pending.accountId !== OUTLOOK_DEFAULT_ACCOUNT) return this.outlookFinishAccountSignIn(tokens, pending, deps);
     const sink = { live: this.settings, vault: this.secrets };
     saveOutlookTokens(sink, tokens);
     this.settings.outlookScopes = trimmed(tokens.scope) || (pending && pending.scopes) || '';
@@ -7910,18 +8055,53 @@ class IcorPlannerPlugin extends Plugin {
     this.syncNow(false);
   }
 
+  // The same for a further account (#38, part 2): its own suffixed fields
+  // and store keys through a sink that names it, its own /me through its
+  // view, its own granted scopes. No calendar feed and no sync yet: those
+  // are the next part, so until then the account is signed in and stored
+  // and nothing reads its mail.
+  async outlookFinishAccountSignIn(tokens, pending, deps) {
+    const id = pending.accountId;
+    const label = outlookAccountById(this.settings, id).label;
+    saveOutlookTokens({ live: this.settings, vault: this.secrets, account: id }, tokens);
+    this.settings[outlookAccountField(id, 'outlookScopes')] = trimmed(tokens.scope) || pending.scopes || '';
+    let account = '';
+    try {
+      const me = await graphRequest(outlookAccountView(this.withSecrets(), id), deps, { url: `${GRAPH_BASE}/me?$select=userPrincipalName,mail,displayName` });
+      account = trimmed(me.mail) || trimmed(me.userPrincipalName) || trimmed(me.displayName);
+    } catch { /* the account line is a nicety; the tokens are what matter */ }
+    writeSecret(this.settings, this.secrets, outlookAccountField(id, 'outlookAccount'), account || 'Microsoft account');
+    await this.saveSettings();
+    if (this._outlookModal) { this._outlookModal.close(); this._outlookModal = null; }
+    new Notice(`Planner: signed in to Outlook (${label})${account ? ` as ${account}` : ''}. Syncing this account comes with a later update.`);
+    if (pending.onDone) pending.onDone();
+  }
+
   // Sign-out clears the four vault keys and the granted scopes. The notes
   // stay, like a removed token elsewhere; the Outlook calendar row stays
   // and says it wants a sign-in. Revoking on Microsoft's side is the
-  // member's own click, linked from the settings tab.
-  async outlookSignOut() {
+  // member's own click, linked from the settings tab. With an account id
+  // that is not the default, that account's keys and nobody else's.
+  async outlookSignOut(accountId) {
+    const id = accountId == null || accountId === '' ? OUTLOOK_DEFAULT_ACCOUNT : String(accountId);
+    if (id !== OUTLOOK_DEFAULT_ACCOUNT) return this.outlookAccountSignOut(id);
     clearOutlookTokens({ live: this.settings, vault: this.secrets });
     this.settings.outlookScopes = '';
-    this._outlookPending = null;
+    this.outlookClearPending(OUTLOOK_DEFAULT_ACCOUNT);
     delete this.syncStatus.outlook;
     await this.saveSettings();
     this.recomputeCalendarDefs();
     new Notice('Planner: signed out of Outlook. The token is gone from this vault; to revoke the app on Microsoft\'s side too, use the link in settings.', 8000);
+  }
+  async outlookAccountSignOut(id) {
+    if (!outlookAccountId(id)) return;
+    const label = outlookAccountById(this.settings, id).label;
+    clearOutlookTokens({ live: this.settings, vault: this.secrets, account: id });
+    // Blank by now in every mode; the suffixed fields leave data.json.
+    for (const f of OUTLOOK_ACCOUNT_FIELDS) delete this.settings[outlookAccountField(id, f)];
+    this.outlookClearPending(id);
+    await this.saveSettings();
+    new Notice(`Planner: signed out of Outlook (${label}). The token is gone from this vault; to revoke the app on Microsoft's side too, use the link in settings.`, 8000);
   }
 
   // A sync run announcing its own hand. Called by every write a sync makes
@@ -9521,6 +9701,10 @@ class OutlookSignInModal extends Modal {
     super(app);
     this.plugin = plugin;
     this.url = (opts && opts.url) || '';
+    // The sign-in this modal was opened for, so the device code fallback
+    // finishes the same account the browser flow would.
+    this.pending = (opts && opts.pending) || null;
+    this.title = (opts && opts.title) || 'Sign in to Outlook';
     this.closed = false;
   }
   onOpen() {
@@ -9531,7 +9715,7 @@ class OutlookSignInModal extends Modal {
     const kicker = contentEl.createDiv({ cls: 'iplan-kicker' });
     kicker.createSpan({ cls: 'iplan-kicker-marker', text: '/' });
     kicker.createSpan({ text: ' MICROSOFT SIGN-IN' });
-    contentEl.createEl('h2', { cls: 'iplan-event-modal-title', text: 'Sign in to Outlook' });
+    contentEl.createEl('h2', { cls: 'iplan-event-modal-title', text: this.title });
     this.statusEl = contentEl.createDiv({ cls: 'iplan-auth-status', attr: { role: 'status', 'aria-live': 'polite' } });
     this.setStatus('Your browser opened Microsoft\'s sign-in page. Sign in there and approve the permissions; you will be brought back here.', false);
     this.bodyEl = contentEl.createDiv({ cls: 'iplan-auth-body' });
@@ -11799,7 +11983,10 @@ class IcorPlannerSettingTab extends PluginSettingTab {
           this.plugin.settings.outlookTenant = OUTLOOK_TENANTS.includes(v) ? v : 'common';
           await this.plugin.saveSettings();
         }));
-    const acct = new Setting(containerEl).setName('Microsoft account');
+    // With a second account listed the rows are told apart by label; a
+    // one-account vault keeps the row it always had.
+    const accounts = outlookAccountList(this.plugin.settings);
+    const acct = new Setting(containerEl).setName(accounts.length > 1 ? `Microsoft account: ${accounts[0].label}` : 'Microsoft account');
     acct.descEl.setAttribute('aria-live', 'polite');
     let signInBtn = null;
     let signOutBtn = null;
@@ -11826,6 +12013,25 @@ class IcorPlannerSettingTab extends PluginSettingTab {
       });
     });
     renderOutlookStatus();
+    // One row per further Microsoft account (#38, part 2): the same
+    // sign-in through the same app registration, its own token set, its
+    // own sign-out. Nothing syncs a further account yet.
+    for (const account of accounts.slice(1)) {
+      const row = new Setting(containerEl).setName(`Microsoft account: ${account.label}`);
+      row.descEl.setAttribute('aria-live', 'polite');
+      const view = outlookAccountView(this.plugin.withSecrets(), account);
+      const signed = outlookSignedIn(view);
+      row.setDesc(`${outlookStatusText(view)}${signed ? ' Syncing this account comes with a later update.' : ''}`);
+      row.addButton((b) => {
+        b.setButtonText(signed ? 'Sign in again' : 'Sign in').setDisabled(!trimmed(view.outlookClientId));
+        if (!signed) b.setCta();
+        b.onClick(() => this.plugin.outlookSignIn({ accountId: account.accountId, onDone: () => this.display() }));
+      });
+      row.addButton((b) => b.setButtonText('Sign out').setDisabled(!signed).onClick(async () => {
+        await this.plugin.outlookSignOut(account.accountId);
+        this.display();
+      }));
+    }
     const revoke = new Setting(containerEl)
       .setName('Manage or revoke access')
       .setDesc('Signing out only removes the token from this vault. To fully revoke access on Microsoft\'s side, visit myaccount.microsoft.com (Apps & services), or account.live.com/consent/Manage for a personal account.');
@@ -12300,4 +12506,7 @@ module.exports.__test = {
   // more than one Microsoft account: the model (#38, part 1)
   OUTLOOK_DEFAULT_ACCOUNT, OUTLOOK_ACCOUNT_ID_RE, outlookAccountId, normalizeOutlookAccount, outlookAccountList,
   outlookAccountById, itemAccountId,
+  // more than one Microsoft account: the sign-in (#38, part 2)
+  OUTLOOK_ACCOUNT_SECRET_FIELDS, OUTLOOK_ACCOUNT_FIELDS, OUTLOOK_PENDING_TTL_MS, outlookAccountField, outlookAccountFieldParts,
+  outlookSecretAccountIds, secretFieldNames, outlookAccountView,
 };
