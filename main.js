@@ -10857,11 +10857,20 @@ function trayEmptyState(source, configured, status, count, total, secretsElsewhe
 // has no tray section (it never becomes per-item notes), so a calendar-only
 // setup still leaves the task tray with nothing to show and still earns the
 // lead block.
+// Whether a source has anything to show: its connector's own answer (the
+// flat settings, which for the source with accounts is the default's
+// sign-in), or, for that source, any listed, enabled further account that
+// is signed in (#38, part 3). A default signed out with a work mailbox
+// signed in is connected; the lead block must not hide work's tasks.
+function sourceConnected(settings, source) {
+  if (sourceConfigured(settings, source)) return true;
+  return sourceHasAccounts(source) && outlookExtraRuns(settings).some((r) => outlookSignedIn(r.view));
+}
 function trayConnectionState(settings) {
-  const configured = SYNCED_SOURCES.filter((k) => sourceConfigured(settings, k));
+  const configured = SYNCED_SOURCES.filter((k) => sourceConnected(settings, k));
   return {
     configured,
-    unconfigured: SYNCED_SOURCES.filter((k) => !sourceConfigured(settings, k)),
+    unconfigured: SYNCED_SOURCES.filter((k) => !sourceConnected(settings, k)),
     calendar: sourceConfigured(settings, 'calendar'),
     allCold: configured.length === 0,
   };
@@ -12769,5 +12778,5 @@ module.exports.__test = {
   outlookSecretAccountIds, secretFieldNames, outlookAccountView,
   // more than one Microsoft account: the sync (#38, part 3)
   sourceHasAccounts, itemShadowAccount, shadowKey, shadowPrefix, outlookExtraRuns, mergeSyncStatus, outlookItemAccount,
-  outlookAccountsNeedingWrite, outlookWriteConsentNotice, outlookProbeGone, shadowedByOtherAccount, anchoredShadowIds,
+  outlookAccountsNeedingWrite, outlookWriteConsentNotice, outlookProbeGone, shadowedByOtherAccount, anchoredShadowIds, sourceConnected,
 };

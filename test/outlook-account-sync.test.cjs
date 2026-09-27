@@ -649,6 +649,42 @@ test('the edit route: an unstamped note keyed under another listed account with 
   assert.match(code(), /if \(!isSyncedSource\(item\.source\)\) return;\n\s*if \(shadowedByOtherAccount\(s, s\._shadow, item\.source, item\)\) return;\n\s*const key = shadowKey\(item\.source, itemShadowAccount\(item\), item\.id\);/, 'the guard sits before any key is read or any call is made');
 });
 
+test('the tray\'s lead block: a further account signed in counts as connected when the default is signed out; switched off or unlisted does not; one account is as before', () => {
+  // The default signed out, work signed in, nothing else connected: before
+  // this fix the tray said "Nothing is connected yet" and hid work's tasks.
+  const out = { outlookRefreshToken: '', outlookAccessToken: '', outlookExpiresAt: '', outlookAccount: '' };
+  const s = T.withSecrets(settingsFor(THREE, out), null);
+  assert.equal(T.sourceConfigured(s, 'outlook'), false, 'the connector\'s own answer is still the default\'s sign-in (pinned elsewhere)');
+  assert.equal(T.sourceConnected(s, 'outlook'), true, 'but the source is connected through work');
+  const conn = T.trayConnectionState(s);
+  assert.equal(conn.allCold, false);
+  assert.deepEqual(conn.configured, ['outlook']);
+  assert.deepEqual(conn.unconfigured, ['todoist', 'clickup', 'email']);
+  // Only old (switched off) signed in besides the default: cold.
+  const offOnly = T.withSecrets(settingsFor(THREE, Object.assign({}, out, { outlookRefreshToken__work: '', outlookAccessToken__work: '' })), null);
+  assert.equal(T.sourceConnected(offOnly, 'outlook'), false, 'a switched-off account contributes no run and does not count');
+  assert.equal(T.trayConnectionState(offOnly).allCold, true);
+  // Work listed but never signed in: cold.
+  const never = T.withSecrets(settingsFor([THREE[0], THREE[1]], Object.assign({}, out, { outlookRefreshToken__work: '', outlookAccessToken__work: '' })), null);
+  assert.equal(T.trayConnectionState(never).allCold, true);
+  // Work's tokens present but work not listed: cold (an id nothing lists has no run).
+  const unlisted = T.withSecrets(settingsFor([THREE[0]], out), null);
+  assert.equal(T.trayConnectionState(unlisted).allCold, true);
+  // No client id at all: nobody is signed in, whatever tokens say.
+  assert.equal(T.trayConnectionState(T.withSecrets(settingsFor(THREE, Object.assign({}, out, { outlookClientId: '' })), null)).allCold, true);
+  // Other sources are untouched by the new answer.
+  for (const k of ['todoist', 'clickup', 'email']) assert.equal(T.sourceConnected(s, k), T.sourceConfigured(s, k));
+  // One account, both shapes: byte for byte the connector's answer.
+  for (const accounts of [null, [{ accountId: 'default', label: 'Personal' }]]) {
+    for (const signed of [true, false]) {
+      const one = T.withSecrets(settingsFor(accounts, signed ? {} : out), null);
+      assert.equal(T.sourceConnected(one, 'outlook'), T.sourceConfigured(one, 'outlook'));
+      assert.equal(T.trayConnectionState(one).allCold, !signed);
+    }
+  }
+  assert.match(code(), /const configured = SYNCED_SOURCES\.filter\(\(k\) => sourceConnected\(settings, k\)\);/);
+});
+
 test('source scan: the pins the sync core keeps, and every shadow key in the class goes through shadowKey', () => {
   const c = code();
   const cls = c.slice(c.indexOf('class IcorPlannerPlugin'), c.indexOf('class IcorPlannerSettingTab'));
